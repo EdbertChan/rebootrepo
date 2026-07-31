@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Prediction Market Reboot Architecture</title>
+    <style>
+      :root {
+        --bg: #f6f8fb;
+        --panel: #ffffff;
+        --ink: #142033;
+        --muted: #617085;
+        --line: #cfd8e5;
+        --state: #1d4ed8;
+        --exec: #047857;
+        --orch: #a16207;
+        --risk: #be123c;
+        --surface: #6d28d9;
+        --shadow: 0 18px 44px rgba(20, 32, 51, 0.09);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-width: 320px;
+        background: var(--bg);
+        color: var(--ink);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        letter-spacing: 0;
+      }
+
+      main {
+        min-height: 100vh;
+        padding: 28px clamp(16px, 4vw, 48px) 44px;
+      }
+
+      header {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 24px;
+        margin: 0 auto 20px;
+        max-width: 1380px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 32px;
+        line-height: 1.1;
+        letter-spacing: 0;
+      }
+
+      .subtitle {
+        margin: 8px 0 0;
+        color: var(--muted);
+        font-size: 15px;
+        line-height: 1.45;
+        max-width: 760px;
+      }
+
+      .badge-row {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 8px;
+      }
+
+      .badge {
+        min-height: 32px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--panel);
+        color: var(--muted);
+        display: inline-flex;
+        align-items: center;
+        padding: 0 12px;
+        font-size: 12px;
+        font-weight: 750;
+        white-space: nowrap;
+      }
+
+      .board {
+        max-width: 1380px;
+        margin: 0 auto;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        overflow: hidden;
+      }
+
+      .legend {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(130px, 1fr));
+        gap: 1px;
+        background: var(--line);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .legend-item {
+        min-height: 46px;
+        background: #f9fbfe;
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 10px 14px;
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 720;
+      }
+
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        flex: 0 0 auto;
+      }
+
+      .diagram-wrap {
+        overflow-x: auto;
+        background: #ffffff;
+      }
+
+      svg {
+        display: block;
+        min-width: 1180px;
+        width: 100%;
+        height: auto;
+      }
+
+      .lane-label {
+        fill: #334155;
+        font-size: 14px;
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+
+      .lane-note {
+        fill: #64748b;
+        font-size: 12px;
+        letter-spacing: 0;
+      }
+
+      .node-title {
+        fill: #122033;
+        font-size: 15px;
+        font-weight: 820;
+        letter-spacing: 0;
+      }
+
+      .node-text {
+        fill: #475569;
+        font-size: 12px;
+        letter-spacing: 0;
+      }
+
+      .small-text {
+        fill: #64748b;
+        font-size: 11px;
+        letter-spacing: 0;
+      }
+
+      .step-num {
+        fill: #ffffff;
+        font-size: 12px;
+        font-weight: 850;
+      }
+
+      .flow-label {
+        fill: #334155;
+        font-size: 11px;
+        font-weight: 750;
+        letter-spacing: 0;
+      }
+
+      .section {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 1px;
+        background: var(--line);
+        border-top: 1px solid var(--line);
+      }
+
+      .panel {
+        background: #fbfdff;
+        padding: 18px;
+        min-height: 164px;
+      }
+
+      .panel h2 {
+        margin: 0 0 10px;
+        font-size: 16px;
+        line-height: 1.25;
+        letter-spacing: 0;
+      }
+
+      .panel ul {
+        margin: 0;
+        padding-left: 18px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      @media (max-width: 900px) {
+        header {
+          display: grid;
+        }
+
+        .badge-row {
+          justify-content: flex-start;
+        }
+
+        .legend {
+          grid-template-columns: 1fr 1fr;
+        }
+
+        .section {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Prediction Market Reboot Architecture</h1>
+          <p class="subtitle">
+            Three-layer design for durable state, concrete execution attempts,
+            and orchestration policy. The UI and MCP tools call one shared
+            User actor, and inspection reads the persisted actors directly.
+          </p>
+        </div>
+        <div class="badge-row" aria-label="Implementation defaults">
+          <span class="badge">Fresh app namespace</span>
+          <span class="badge">Binary YES / NO</span>
+          <span class="badge">Creator resolves</span>
+          <span class="badge">Simulated gateway</span>
+        </div>
+      </header>
+
+      <section class="board" aria-label="Architecture diagram">
+        <div class="legend">
+          <div class="legend-item">
+            <span class="dot" style="background: var(--surface)"></span>
+            Surfaces
+          </div>
+          <div class="legend-item">
+            <span class="dot" style="background: var(--state)"></span>
+            State
+          </div>
+          <div class="legend-item">
+            <span class="dot" style="background: var(--exec)"></span>
+            Execution
+          </div>
+          <div class="legend-item">
+            <span class="dot" style="background: var(--orch)"></span>
+            Orchestration
+          </div>
+          <div class="legend-item">
+            <span class="dot" style="background: var(--risk)"></span>
+            Audit and inspect
+          </div>
+        </div>
+
+        <div class="diagram-wrap">
+          <svg viewBox="0 0 1380 760" role="img" aria-labelledby="title desc">
+            <title id="title">Prediction Market Reboot Architecture</title>
+            <desc id="desc">
+              Architecture diagram showing surfaces, Reboot API, durable state
+              actors, execution workflows, orchestration policy, and audit
+              inspection paths.
+            </desc>
+
+            <defs>
+              <marker
+                id="arrow"
+                markerWidth="12"
+                markerHeight="12"
+                refX="10"
+                refY="6"
+                orient="auto"
+                markerUnits="strokeWidth"
+              >
+                <path d="M2,2 L10,6 L2,10 Z" fill="#64748b" />
+              </marker>
+              <marker
+                id="arrow-strong"
+                markerWidth="12"
+                markerHeight="12"
+                refX="10"
+                refY="6"
+                orient="auto"
+                markerUnits="strokeWidth"
+              >
+                <path d="M2,2 L10,6 L2,10 Z" fill="#1f2937" />
+              </marker>
+            </defs>
+
+            <rect x="28" y="32" width="1324" height="668" rx="8" fill="#f8fafc" />
+            <rect x="48" y="74" width="216" height="570" rx="8" fill="#faf7ff" stroke="#d8c9fb" />
+            <rect x="286" y="74" width="278" height="570" rx="8" fill="#eff6ff" stroke="#bfdbfe" />
+            <rect x="586" y="74" width="278" height="570" rx="8" fill="#ecfdf5" stroke="#bbf7d0" />
+            <rect x="886" y="74" width="278" height="570" rx="8" fill="#fffbeb" stroke="#fde68a" />
+            <rect x="1186" y="74" width="136" height="570" rx="8" fill="#fff1f2" stroke="#fecdd3" />
+
+            <text class="lane-label" x="66" y="104">Surfaces</text>
+            <text class="lane-note" x="66" y="124">Humans and clients</text>
+            <text class="lane-label" x="306" y="104">State Layer</text>
+            <text class="lane-note" x="306" y="124">Durable facts</text>
+            <text class="lane-label" x="606" y="104">Execution Layer</text>
+            <text class="lane-note" x="606" y="124">Concrete attempts</text>
+            <text class="lane-label" x="906" y="104">Orchestration Layer</text>
+            <text class="lane-note" x="906" y="124">Policy and recovery</text>
+            <text class="lane-label" x="1206" y="104">Inspect</text>
+            <text class="lane-note" x="1206" y="124">Read-only proof</text>
+
+            <!-- Surface nodes -->
+            <rect x="72" y="164" width="168" height="74" rx="8" fill="#ffffff" stroke="#b99df8" />
+            <text class="node-title" x="92" y="193">Web SPA</text>
+            <text class="node-text" x="92" y="214">browse, bet, resolve</text>
+
+            <rect x="72" y="268" width="168" height="74" rx="8" fill="#ffffff" stroke="#b99df8" />
+            <text class="node-title" x="92" y="297">MCP Chat App</text>
+            <text class="node-text" x="92" y="318">embedded UI + tools</text>
+
+            <rect x="72" y="372" width="168" height="74" rx="8" fill="#ffffff" stroke="#b99df8" />
+            <text class="node-title" x="92" y="401">ChatGPT Tools</text>
+            <text class="node-text" x="92" y="422">natural language calls</text>
+
+            <!-- State nodes -->
+            <rect x="318" y="148" width="214" height="94" rx="8" fill="#ffffff" stroke="#93c5fd" />
+            <text class="node-title" x="342" y="176">User actor</text>
+            <text class="node-text" x="342" y="198">balance: 1000 credits</text>
+            <text class="node-text" x="342" y="218">bet and ledger indexes</text>
+
+            <rect x="318" y="270" width="214" height="104" rx="8" fill="#ffffff" stroke="#93c5fd" />
+            <text class="node-title" x="342" y="298">Market actor</text>
+            <text class="node-text" x="342" y="320">question, creator, status</text>
+            <text class="node-text" x="342" y="340">close time, result</text>
+            <text class="node-text" x="342" y="360">bet and audit indexes</text>
+
+            <rect x="318" y="402" width="214" height="94" rx="8" fill="#ffffff" stroke="#93c5fd" />
+            <text class="node-title" x="342" y="430">Bet actor</text>
+            <text class="node-text" x="342" y="452">outcome, stake, status</text>
+            <text class="node-text" x="342" y="472">payout intent id</text>
+
+            <rect x="318" y="524" width="214" height="82" rx="8" fill="#ffffff" stroke="#93c5fd" />
+            <text class="node-title" x="342" y="552">PaymentIntent</text>
+            <text class="node-text" x="342" y="574">amount, status</text>
+            <text class="node-text" x="342" y="594">attempt history</text>
+
+            <!-- Execution nodes -->
+            <rect x="618" y="140" width="214" height="84" rx="8" fill="#ffffff" stroke="#86efac" />
+            <text class="node-title" x="642" y="168">place_bet transaction</text>
+            <text class="node-text" x="642" y="190">debit + Bet + audit</text>
+            <text class="node-text" x="642" y="208">all-or-nothing</text>
+
+            <rect x="618" y="252" width="214" height="84" rx="8" fill="#ffffff" stroke="#86efac" />
+            <text class="node-title" x="642" y="280">close_if_due writer</text>
+            <text class="node-text" x="642" y="302">scheduled at creation</text>
+            <text class="node-text" x="642" y="320">marks market closed</text>
+
+            <rect x="618" y="364" width="214" height="94" rx="8" fill="#ffffff" stroke="#86efac" />
+            <text class="node-title" x="642" y="392">payout workflow</text>
+            <text class="node-text" x="642" y="414">PaymentIntent.run</text>
+            <text class="node-text" x="642" y="434">memoized gateway call</text>
+
+            <rect x="618" y="488" width="214" height="94" rx="8" fill="#ffffff" stroke="#86efac" />
+            <text class="node-title" x="642" y="516">simulated gateway</text>
+            <text class="node-text" x="642" y="538">success, timeout, crash</text>
+            <text class="node-text" x="642" y="558">per-attempt response</text>
+
+            <!-- Orchestration nodes -->
+            <rect x="918" y="144" width="214" height="88" rx="8" fill="#ffffff" stroke="#facc15" />
+            <text class="node-title" x="942" y="172">market policy</text>
+            <text class="node-text" x="942" y="194">creator resolves only</text>
+            <text class="node-text" x="942" y="212">closed markets reject bets</text>
+
+            <rect x="918" y="270" width="214" height="88" rx="8" fill="#ffffff" stroke="#facc15" />
+            <text class="node-title" x="942" y="298">settlement policy</text>
+            <text class="node-text" x="942" y="320">winner gets stake x 2</text>
+            <text class="node-text" x="942" y="338">loser payout is zero</text>
+
+            <rect x="918" y="396" width="214" height="104" rx="8" fill="#ffffff" stroke="#facc15" />
+            <text class="node-title" x="942" y="424">retry and reconcile</text>
+            <text class="node-text" x="942" y="446">retry gateway 3 times</text>
+            <text class="node-text" x="942" y="466">no double credit</text>
+            <text class="node-text" x="942" y="486">escalate review-needed</text>
+
+            <rect x="918" y="536" width="214" height="74" rx="8" fill="#ffffff" stroke="#facc15" />
+            <text class="node-title" x="942" y="564">audit policy</text>
+            <text class="node-text" x="942" y="586">append first, display later</text>
+
+            <!-- Inspect nodes -->
+            <rect x="1206" y="174" width="92" height="82" rx="8" fill="#ffffff" stroke="#fda4af" />
+            <text class="node-title" x="1222" y="202">rbt</text>
+            <text class="node-title" x="1222" y="222">inspect</text>
+            <text class="small-text" x="1222" y="242">state JSON</text>
+
+            <rect x="1206" y="414" width="92" height="92" rx="8" fill="#ffffff" stroke="#fda4af" />
+            <text class="node-title" x="1222" y="442">Audit</text>
+            <text class="node-title" x="1222" y="462">log</text>
+            <text class="small-text" x="1222" y="482">timeline</text>
+
+            <!-- Arrows from surfaces -->
+            <path d="M240 201 C276 201 278 195 318 195" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)" />
+            <path d="M240 305 C278 305 278 196 318 196" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)" />
+            <path d="M240 409 C276 409 278 198 318 198" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)" />
+            <text class="flow-label" x="254" y="185">User API</text>
+
+            <!-- State to execution -->
+            <path d="M532 195 C570 195 580 182 618 182" fill="none" stroke="#1f2937" stroke-width="2.2" marker-end="url(#arrow-strong)" />
+            <circle cx="586" cy="182" r="12" fill="#1d4ed8" />
+            <text class="step-num" x="582" y="187">1</text>
+
+            <path d="M532 322 C570 322 580 294 618 294" fill="none" stroke="#1f2937" stroke-width="2.2" marker-end="url(#arrow-strong)" />
+            <circle cx="586" cy="296" r="12" fill="#1d4ed8" />
+            <text class="step-num" x="582" y="301">2</text>
+
+            <path d="M532 450 C570 450 580 414 618 414" fill="none" stroke="#1f2937" stroke-width="2.2" marker-end="url(#arrow-strong)" />
+            <circle cx="586" cy="414" r="12" fill="#1d4ed8" />
+            <text class="step-num" x="582" y="419">3</text>
+
+            <path d="M725 458 L725 488" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)" />
+            <path d="M618 535 C584 535 568 566 532 566" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)" />
+
+            <!-- Execution to orchestration -->
+            <path d="M832 182 C870 182 880 188 918 188" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)" />
+            <path d="M832 294 C870 294 880 312 918 312" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)" />
+            <path d="M832 414 C870 414 880 448 918 448" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)" />
+            <path d="M832 535 C874 535 878 574 918 574" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)" />
+
+            <!-- Orchestration feedback loops -->
+            <path d="M1025 500 C1025 526 876 626 532 566" fill="none" stroke="#a16207" stroke-width="2" stroke-dasharray="7 6" marker-end="url(#arrow)" />
+            <text class="flow-label" x="813" y="640">record attempt, failure class, payout status</text>
+
+            <path d="M1025 358 C1025 374 892 380 832 414" fill="none" stroke="#a16207" stroke-width="2" stroke-dasharray="7 6" marker-end="url(#arrow)" />
+            <text class="flow-label" x="872" y="384">spawn payouts</text>
+
+            <!-- Audit and inspect -->
+            <path d="M1132 574 C1172 574 1174 462 1206 462" fill="none" stroke="#be123c" stroke-width="2" marker-end="url(#arrow)" />
+            <path d="M532 322 C766 660 1050 650 1206 462" fill="none" stroke="#be123c" stroke-width="1.8" stroke-dasharray="6 6" marker-end="url(#arrow)" />
+            <path d="M532 566 C700 688 1050 338 1206 218" fill="none" stroke="#be123c" stroke-width="1.8" stroke-dasharray="6 6" marker-end="url(#arrow)" />
+            <text class="flow-label" x="1120" y="208">inspect actors</text>
+
+            <!-- Flow notes -->
+            <rect x="72" y="528" width="168" height="80" rx="8" fill="#ffffff" stroke="#d8c9fb" />
+            <text class="node-title" x="92" y="556">MVP flow</text>
+            <text class="node-text" x="92" y="578">create -> bet -> close</text>
+            <text class="node-text" x="92" y="598">resolve -> payout</text>
+
+            <text class="small-text" x="318" y="674">
+              Durable state is the source of truth. Execution records explain what happened. Orchestration chooses retries, reconciliation, and review escalation.
+            </text>
+          </svg>
+        </div>
+
+        <div class="section">
+          <article class="panel">
+            <h2>State</h2>
+            <ul>
+              <li>Actor state stores account credits, market status, bet status, payment intent status, and audit IDs.</li>
+              <li>Growing collections use `OrderedMap` IDs stored on owner state.</li>
+              <li>All user-visible facts are inspectable through Reboot state.</li>
+            </ul>
+          </article>
+          <article class="panel">
+            <h2>Execution</h2>
+            <ul>
+              <li>Transactions handle atomic debits, bet creation, and audit writes.</li>
+              <li>Workflows handle simulated gateway calls and restart recovery.</li>
+              <li>Attempt history records started, succeeded, failed, timed out, and crashed states.</li>
+            </ul>
+          </article>
+          <article class="panel">
+            <h2>Orchestration</h2>
+            <ul>
+              <li>Creator-only resolution starts payout orchestration after close.</li>
+              <li>Gateway retries stop after three attempts, then mark review needed.</li>
+              <li>Audit logs are written before the UI depends on them.</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

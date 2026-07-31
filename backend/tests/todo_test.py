@@ -3,9 +3,6 @@ import unittest
 from reboot.aio.aborted import Aborted
 from reboot.aio.applications import Application
 from reboot.aio.tests import Reboot
-from reboot.std.collections.ordered_map.v1.ordered_map import (
-    ordered_map_library,
-)
 from servicers.todo import TaskServicer, UserServicer
 from todo.v1.todo_rbt import User
 
@@ -17,7 +14,6 @@ class TodoTest(unittest.IsolatedAsyncioTestCase):
         await self.rbt.up(
             Application(
                 servicers=[UserServicer, TaskServicer],
-                libraries=[ordered_map_library()],
             ),
         )
         self.user_id = f"alice-{self.id()}"

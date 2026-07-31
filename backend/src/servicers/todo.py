@@ -9,10 +9,8 @@ from reboot.aio.auth.authorizers import (
     is_app_internal,
 )
 from reboot.aio.contexts import ReaderContext, TransactionContext, WriterContext
-from reboot.std.collections.ordered_map.v1.ordered_map import OrderedMap
 from todo.v1.todo import TaskState, TaskSummary
 from todo.v1.todo_rbt import Task, User
-from uuid7 import create as uuid7
 
 
 PAGE_LIMIT_DEFAULT = 50
@@ -47,8 +45,7 @@ def _task_authorizer() -> AuthorizerRule[TaskState, Any]:
 class UserServicer(User.Servicer):
     async def create(self, context: TransactionContext) -> None:
         if context.constructor:
-            self.state.tasks_index_id = str(uuid4())
-            await OrderedMap.ref(self.state.tasks_index_id).create(context)
+            self.state.task_ids = []
 
     async def dashboard(
         self,
@@ -58,24 +55,16 @@ class UserServicer(User.Servicer):
         limit = request.limit or PAGE_LIMIT_DEFAULT
         limit = max(1, min(limit, PAGE_LIMIT_MAX))
 
-        tasks_index = OrderedMap.ref(self.state.tasks_index_id)
-        if request.cursor:
-            page = await tasks_index.range(
-                context,
-                start_key=request.cursor,
-                limit=limit + 1,
-            )
-        else:
-            page = await tasks_index.range(context, limit=limit + 1)
-
-        entries = list(page.entries)
-        if request.cursor and entries and entries[0].key == request.cursor:
-            entries = entries[1:]
+        try:
+            start = int(request.cursor) if request.cursor else 0
+        except ValueError:
+            start = 0
+        start = max(0, start)
+        task_ids = self.state.task_ids[start : start + limit + 1]
 
         user_id = self.ref().state_id
         tasks: list[TaskSummary] = []
-        for entry in entries[:limit]:
-            task_id = entry.bytes.decode()
+        for task_id in task_ids[:limit]:
             task = await Task.ref(task_id).get(context)
             if task.deleted or task.owner_user_id != user_id:
                 continue
@@ -89,8 +78,8 @@ class UserServicer(User.Servicer):
             )
 
         next_cursor = ""
-        if len(entries) > limit and entries[limit - 1:limit]:
-            next_cursor = entries[limit - 1].key
+        if len(task_ids) > limit:
+            next_cursor = str(start + limit)
 
         return User.DashboardResponse(tasks=tasks, next_cursor=next_cursor)
 
@@ -100,7 +89,6 @@ class UserServicer(User.Servicer):
         request: User.CreateTaskRequest,
     ) -> User.CreateTaskResponse:
         task_id = str(uuid4())
-        index_key = str(uuid7())
         title = _normalized_title(request.title)
         notes = _normalized_notes(request.notes)
 
@@ -108,15 +96,10 @@ class UserServicer(User.Servicer):
             context,
             task_id,
             owner_user_id=self.ref().state_id,
-            index_key=index_key,
             title=title,
             notes=notes,
         )
-        await OrderedMap.ref(self.state.tasks_index_id).insert(
-            context,
-            key=index_key,
-            bytes=task.state_id.encode(),
-        )
+        self.state.task_ids.append(task.state_id)
         return User.CreateTaskResponse(task_id=task.state_id)
 
     async def update_task(
@@ -162,10 +145,11 @@ class UserServicer(User.Servicer):
             User.DeleteTaskAborted,
         )
         await Task.ref(task.task_id).mark_deleted(context)
-        await OrderedMap.ref(self.state.tasks_index_id).remove(
-            context,
-            key=task.index_key,
-        )
+        self.state.task_ids = [
+            stored_task_id
+            for stored_task_id in self.state.task_ids
+            if stored_task_id != task.task_id
+        ]
 
     async def _task_for_request(
         self,
@@ -194,7 +178,6 @@ class TaskServicer(Task.Servicer):
     ) -> None:
         if context.constructor:
             self.state.owner_user_id = request.owner_user_id
-            self.state.index_key = request.index_key
             self.state.title = _normalized_title(request.title)
             self.state.notes = _normalized_notes(request.notes)
             self.state.completed = False
@@ -204,7 +187,6 @@ class TaskServicer(Task.Servicer):
         return Task.GetResponse(
             task_id=self.ref().state_id,
             owner_user_id=self.state.owner_user_id,
-            index_key=self.state.index_key,
             title=self.state.title,
             notes=self.state.notes,
             completed=self.state.completed,

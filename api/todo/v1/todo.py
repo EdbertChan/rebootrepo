@@ -13,7 +13,7 @@ from reboot.api import (
 
 
 class UserState(Model):
-    tasks_index_id: str = Field(tag=1, default="")
+    task_ids: list[str] = Field(tag=1, default_factory=list)
 
 
 class TaskSummary(Model):
@@ -60,28 +60,25 @@ class DeleteTaskRequest(Model):
 
 class TaskState(Model):
     owner_user_id: str = Field(tag=1, default="")
-    index_key: str = Field(tag=2, default="")
-    title: str = Field(tag=3, default="")
-    notes: str = Field(tag=4, default="")
-    completed: bool = Field(tag=5, default=False)
-    deleted: bool = Field(tag=6, default=False)
+    title: str = Field(tag=2, default="")
+    notes: str = Field(tag=3, default="")
+    completed: bool = Field(tag=4, default=False)
+    deleted: bool = Field(tag=5, default=False)
 
 
 class TaskCreateRequest(Model):
     owner_user_id: str = Field(tag=1, default="")
-    index_key: str = Field(tag=2, default="")
-    title: str = Field(tag=3, default="")
-    notes: str = Field(tag=4, default="")
+    title: str = Field(tag=2, default="")
+    notes: str = Field(tag=3, default="")
 
 
 class TaskRecord(Model):
     task_id: str = Field(tag=1, default="")
     owner_user_id: str = Field(tag=2, default="")
-    index_key: str = Field(tag=3, default="")
-    title: str = Field(tag=4, default="")
-    notes: str = Field(tag=5, default="")
-    completed: bool = Field(tag=6, default=False)
-    deleted: bool = Field(tag=7, default=False)
+    title: str = Field(tag=3, default="")
+    notes: str = Field(tag=4, default="")
+    completed: bool = Field(tag=5, default=False)
+    deleted: bool = Field(tag=6, default=False)
 
 
 class TaskUpdateRequest(Model):
