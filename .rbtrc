@@ -14,8 +14,8 @@ dev run --watch=api/**/*.py
 dev run --python
 
 # Save local durable state between restarts.
-dev run --application-name=reboot-event-todo
-dev expunge --application-name=reboot-event-todo
+dev run --application-name=reboot-event-predictions
+dev expunge --application-name=reboot-event-predictions
 
 # Load local secrets from a git-ignored env file.
 dev run --env-file=.env
@@ -33,5 +33,5 @@ dev run:dist --frontend-dist-path=frontend/dist
 serve run --python
 serve run --frontend-dist-path=frontend/dist --frontend-root-path=frontend
 serve run --application=backend/src/main.py
-serve run --application-name=reboot-event-todo
+serve run --application-name=reboot-event-predictions
 serve run --tls=external

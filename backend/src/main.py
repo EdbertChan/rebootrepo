@@ -7,7 +7,8 @@ from reboot.aio.auth.oauth_providers import (
     Development,
     OAuthProviderByEnvironment,
 )
-from servicers.todo import TaskServicer, UserServicer
+from reboot.std.collections.ordered_map.v1.ordered_map import ordered_map_library
+from servicers.predictions import APPLICATION_SERVICERS
 
 
 logging.basicConfig(
@@ -18,9 +19,10 @@ logging.basicConfig(
 
 async def main() -> None:
     application = Application(
-        title="Todo Board",
-        description="Create, organize, complete, and delete personal tasks.",
-        servicers=[UserServicer, TaskServicer],
+        title="Prediction Markets",
+        description="Create markets, place demo-credit bets, resolve outcomes, and audit payouts.",
+        servicers=APPLICATION_SERVICERS,
+        libraries=[ordered_map_library()],
         oauth=OAuthProviderByEnvironment(
             dev=Development(),
             prod=None,

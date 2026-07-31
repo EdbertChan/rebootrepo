@@ -3,20 +3,18 @@ from reboot.application import ExamplePrompt
 
 example_prompts = [
     ExamplePrompt(
-        title="Plan today",
+        title="Create a market",
         prompts=[
-            "Create a task called \"Confirm venue\" with the note "
-            "\"Email the event space before noon.\"",
-            "Create another task called \"Send invites\" and then show "
-            "me my todo board.",
+            "Create a prediction market: \"Will the demo pass today?\" "
+            "that closes immediately.",
+            "Show me my prediction market dashboard.",
         ],
     ),
     ExamplePrompt(
-        title="Clean up the list",
+        title="Bet and resolve",
         prompts=[
-            "List my current tasks.",
-            "Mark the venue task complete.",
-            "Show me the todo board again.",
+            "Place a 25 credit YES bet on my newest open market.",
+            "Resolve the market as YES and show me the audit log.",
         ],
     ),
 ]
