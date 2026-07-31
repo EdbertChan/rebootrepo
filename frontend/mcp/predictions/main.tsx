@@ -1,13 +1,13 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { RebootClientProvider } from "@reboot-dev/reboot-react";
-import { TodoMcpApp } from "./App";
+import { PredictionMarketMcpApp } from "./App";
 import "./index.css";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <RebootClientProvider>
-      <TodoMcpApp />
+      <PredictionMarketMcpApp />
     </RebootClientProvider>
   </StrictMode>,
 );

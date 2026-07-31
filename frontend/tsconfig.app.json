@@ -21,5 +21,5 @@
       "@api/*": ["./api/*"]
     }
   },
-  "include": ["mcp", "web", "vite-env.d.ts"]
+  "include": ["mcp", "shared", "web", "vite-env.d.ts"]
 }
