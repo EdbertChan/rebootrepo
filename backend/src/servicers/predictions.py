@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Awaitable, Callable, Optional
+from uuid import NAMESPACE_URL, uuid5
 
 from predictions.v1.predictions import PaymentAttempt
 from predictions.v1.predictions_rbt import (
@@ -12,11 +14,14 @@ from predictions.v1.predictions_rbt import (
     User,
 )
 from reboot.aio.contexts import ReaderContext, TransactionContext, WorkflowContext, WriterContext
+from reboot.aio.workflows import PER_WORKFLOW, at_least_once
 from reboot.std.collections.ordered_map.v1.ordered_map import OrderedMap
 
 
 INITIAL_CREDITS = 0
 CATALOG_MARKET_INDEX_ID = "catalog:markets"
+MAX_PAYMENT_ATTEMPTS = 3
+MAX_PAYMENT_ATTEMPT_HISTORY = 3
 
 
 @dataclass(frozen=True)
@@ -27,12 +32,37 @@ class GatewayOutcome:
     message: str = ""
 
 
-def configure_gateway_for_tests(charge: object) -> None:
-    del charge
+PaymentGateway = Callable[[str, int, str, int], Awaitable[GatewayOutcome]]
+
+
+async def _default_gateway_charge(
+    payment_intent_id: str,
+    amount: int,
+    idempotency_key: str,
+    attempt_number: int,
+) -> GatewayOutcome:
+    del amount, idempotency_key, attempt_number
+    return GatewayOutcome(
+        status="success",
+        provider_transaction_id=f"simulated:{payment_intent_id}",
+    )
+
+
+_gateway_charge: PaymentGateway = _default_gateway_charge
+
+
+def configure_gateway_for_tests(charge: PaymentGateway) -> None:
+    global _gateway_charge
+    _gateway_charge = charge
 
 
 def reset_gateway_for_tests() -> None:
-    return None
+    global _gateway_charge
+    _gateway_charge = _default_gateway_charge
+
+
+def _payment_idempotency_key(payment_intent_id: str) -> str:
+    return str(uuid5(NAMESPACE_URL, f"payment-intent:{payment_intent_id}"))
 
 
 def _user_created_market_index_id(user_id: str) -> str:
@@ -339,8 +369,8 @@ class PaymentIntentServicer(PaymentIntent.Servicer):
         self.state.market_id = request.market_id
         self.state.bet_id = request.bet_id
         self.state.amount = request.amount
-        self.state.status = ""
-        self.state.idempotency_key = ""
+        self.state.status = "pending"
+        self.state.idempotency_key = _payment_idempotency_key(self.ref().state_id)
         self.state.failure_class = ""
         self.state.attempts = []
 
@@ -364,6 +394,11 @@ class PaymentIntentServicer(PaymentIntent.Servicer):
         request: PaymentIntent.RecordAttemptRequest,
     ) -> None:
         del context
+        if any(
+            attempt.attempt_number == request.attempt_number
+            for attempt in self.state.attempts
+        ):
+            return
         self.state.attempts.append(
             PaymentAttempt(
                 attempt_number=request.attempt_number,
@@ -373,6 +408,7 @@ class PaymentIntentServicer(PaymentIntent.Servicer):
                 message=request.message,
             )
         )
+        self.state.attempts = self.state.attempts[-MAX_PAYMENT_ATTEMPT_HISTORY:]
 
     async def record_status(
         self,
@@ -389,12 +425,87 @@ class PaymentIntentServicer(PaymentIntent.Servicer):
         request: PaymentIntent.RecordSuccessRequest,
     ) -> None:
         del context, request
-        self.state.status = ""
+        self.state.status = "succeeded"
         self.state.failure_class = ""
 
     @classmethod
     async def run(cls, context: WorkflowContext) -> None:
-        del context
+        payment_intent_id = context.state_id
+        payment = PaymentIntent.ref(payment_intent_id)
+
+        current = await payment.per_workflow("load-payment-intent").get(context)
+        if current.status in {"succeeded", "failed", "retry_exhausted"}:
+            return
+
+        await payment.per_workflow("mark-processing").record_status(
+            context,
+            status="processing",
+            failure_class="",
+        )
+
+        idempotency_key = current.idempotency_key
+        if idempotency_key == "":
+            idempotency_key = _payment_idempotency_key(payment_intent_id)
+
+        next_attempt = len(current.attempts) + 1
+        while next_attempt <= MAX_PAYMENT_ATTEMPTS:
+            attempt_number = next_attempt
+
+            async def charge() -> GatewayOutcome:
+                return await _gateway_charge(
+                    payment_intent_id,
+                    current.amount,
+                    idempotency_key,
+                    attempt_number,
+                )
+
+            outcome = await at_least_once(
+                (f"charge-gateway-attempt-{attempt_number}", PER_WORKFLOW),
+                context,
+                charge,
+                type=GatewayOutcome,
+            )
+            await payment.per_workflow(
+                f"record-gateway-attempt-{attempt_number}"
+            ).record_attempt(
+                context,
+                attempt_number=attempt_number,
+                status=outcome.status,
+                failure_class=outcome.failure_class,
+                provider_transaction_id=outcome.provider_transaction_id,
+                message=outcome.message,
+            )
+
+            if outcome.status == "success":
+                await payment.per_workflow("mark-succeeded").record_success(
+                    context,
+                    provider_transaction_id=outcome.provider_transaction_id,
+                )
+                return
+
+            if outcome.status in {"permanent_failure", "business_failure"}:
+                await payment.per_workflow("mark-failed").record_status(
+                    context,
+                    status="failed",
+                    failure_class=outcome.failure_class,
+                )
+                return
+
+            if outcome.status != "retryable_failure":
+                await payment.per_workflow("mark-unknown-failed").record_status(
+                    context,
+                    status="failed",
+                    failure_class=outcome.failure_class or "unknown_gateway_status",
+                )
+                return
+
+            next_attempt += 1
+
+        await payment.per_workflow("mark-retry-exhausted").record_status(
+            context,
+            status="retry_exhausted",
+            failure_class="retry_exhausted",
+        )
 
 
 class AuditEventServicer(AuditEvent.Servicer):
