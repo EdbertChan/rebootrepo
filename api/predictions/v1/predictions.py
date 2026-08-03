@@ -315,6 +315,14 @@ class AuditEventCreateRequest(Model):
     sequence: int = Field(tag=7, default=0)
 
 
+class AuditEventUpdateRequest(Model):
+    event_type: str = Field(tag=1, default="")
+    message: str = Field(tag=2, default="")
+    bet_id: str = Field(tag=3, default="")
+    payment_intent_id: str = Field(tag=4, default="")
+    sequence: int = Field(tag=5, default=0)
+
+
 UserMethods = Methods(
     show=UI(
         request=None,
@@ -409,6 +417,11 @@ MarketMethods = Methods(
         mcp=None,
     ),
     close_if_due=Writer(
+        request=None,
+        response=None,
+        mcp=None,
+    ),
+    spawn_payouts=Workflow(
         request=None,
         response=None,
         mcp=None,
@@ -512,6 +525,11 @@ AuditEventMethods = Methods(
     get=Reader(
         request=None,
         response=AuditEventSummary,
+        mcp=None,
+    ),
+    update=Writer(
+        request=AuditEventUpdateRequest,
+        response=None,
         mcp=None,
     ),
 )
