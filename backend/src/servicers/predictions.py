@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Awaitable, Callable
+from typing import Any
 from uuid import uuid4
 
 from predictions.v1.predictions import (
@@ -21,8 +20,7 @@ from predictions.v1.predictions_rbt import (
     PaymentIntent,
     User,
 )
-from reboot.aio.contexts import ReaderContext, TransactionContext, WorkflowContext, WriterContext
-from reboot.aio.workflows import at_least_once
+from reboot.aio.contexts import ReaderContext, TransactionContext, WriterContext
 from reboot.std.collections.ordered_map.v1.ordered_map import OrderedMap
 
 
@@ -35,56 +33,8 @@ VALID_OUTCOMES = {"YES", "NO"}
 MARKET_OPEN = "open"
 MARKET_CLOSED = "closed"
 MARKET_RESOLVED = "resolved"
-MARKET_REVIEW_REQUIRED = "review_required"
 BET_PLACED = "placed"
-BET_WON_PENDING = "won_pending"
-BET_WON_PAID = "won_paid"
-BET_LOST = "lost"
-BET_PAYMENT_FAILED = "payment_failed"
 PAYMENT_PENDING = "pending"
-PAYMENT_RUNNING = "running"
-PAYMENT_SUCCEEDED = "succeeded"
-PAYMENT_RETRY_EXHAUSTED = "retry_exhausted"
-PAYMENT_FAILED = "failed"
-
-
-@dataclass(frozen=True)
-class GatewayOutcome:
-    status: str
-    failure_class: str = ""
-    provider_transaction_id: str = ""
-    message: str = ""
-
-
-GatewayCharge = Callable[[str, int, str, int], Awaitable[GatewayOutcome]]
-
-
-async def _default_gateway_charge(
-    payment_intent_id: str,
-    amount: int,
-    idempotency_key: str,
-    attempt_number: int,
-) -> GatewayOutcome:
-    return GatewayOutcome(
-        status="success",
-        provider_transaction_id=(
-            f"simulated:{payment_intent_id}:{idempotency_key}:attempt-{attempt_number}"
-        ),
-        message="Simulated gateway accepted payout.",
-    )
-
-
-gateway_charge: GatewayCharge = _default_gateway_charge
-
-
-def configure_gateway_for_tests(charge: GatewayCharge) -> None:
-    global gateway_charge
-    gateway_charge = charge
-
-
-def reset_gateway_for_tests() -> None:
-    global gateway_charge
-    gateway_charge = _default_gateway_charge
 
 
 def _prediction_error(code: str, message: str) -> PredictionError:
@@ -183,7 +133,7 @@ async def _read_ids(
 
 
 async def _insert_id(
-    context: TransactionContext | WorkflowContext,
+    context: TransactionContext,
     map_id: str,
     key: str,
     value_id: str,
@@ -196,7 +146,7 @@ async def _insert_id(
 
 
 async def _append_audit(
-    context: TransactionContext | WorkflowContext,
+    context: TransactionContext,
     *,
     market_id: str,
     audit_index_id: str,
@@ -205,31 +155,9 @@ async def _append_audit(
     message: str,
     bet_id: str = "",
     payment_intent_id: str = "",
-    workflow_alias_prefix: str = "",
 ) -> str:
-    event_id = str(uuid4()) if workflow_alias_prefix == "" else (
-        f"{payment_intent_id}:{event_type}:{workflow_alias_prefix}"
-    )
-    key = _map_key("audit") if workflow_alias_prefix == "" else event_id
-
-    if workflow_alias_prefix == "":
-        await AuditEvent.create(
-            context,
-            event_id,
-            market_id=market_id,
-            actor_user_id=actor_user_id,
-            event_type=event_type,
-            message=message,
-            bet_id=bet_id,
-            payment_intent_id=payment_intent_id,
-            sequence=0,
-        )
-        await _insert_id(context, audit_index_id, key, event_id)
-        return event_id
-
-    await AuditEvent.per_workflow(
-        f"Create audit event {workflow_alias_prefix}"
-    ).create(
+    event_id = str(uuid4())
+    await AuditEvent.create(
         context,
         event_id,
         market_id=market_id,
@@ -240,13 +168,7 @@ async def _append_audit(
         payment_intent_id=payment_intent_id,
         sequence=0,
     )
-    await OrderedMap.ref(audit_index_id).per_workflow(
-        f"Index audit event {workflow_alias_prefix}"
-    ).insert(
-        context,
-        key=key,
-        bytes=event_id.encode(),
-    )
+    await _insert_id(context, audit_index_id, _map_key("audit"), event_id)
     return event_id
 
 
@@ -349,7 +271,7 @@ class UserServicer(User.Servicer):
             limit=PAGE_LIMIT_DEFAULT,
             reverse=True,
         )
-        payments = [
+        payments: list[PaymentIntentSummary] = [
             await PaymentIntent.ref(payment_id).get(context)
             for payment_id in payment_ids
         ]
@@ -416,6 +338,9 @@ class UserServicer(User.Servicer):
         context: TransactionContext,
         request: User.PlaceBetRequest,
     ) -> User.PlaceBetResponse:
+        # Skeleton only: records a bet against the market. Debiting the
+        # placing user's credit balance is trading behavior owned by a
+        # later slice and is intentionally not performed here.
         user_id = self.ref().state_id
         _require_signed_in_user(context, user_id, User.PlaceBetAborted)
 
@@ -428,10 +353,6 @@ class UserServicer(User.Servicer):
             raise User.PlaceBetAborted(
                 _prediction_error("invalid_stake", "Stake must be a positive integer.")
             )
-        if self.state.balance < request.stake:
-            raise User.PlaceBetAborted(
-                _prediction_error("insufficient_credits", "Not enough credits.")
-            )
 
         market = await Market.ref(request.market_id).get(context)
         if market.status != MARKET_OPEN:
@@ -440,7 +361,6 @@ class UserServicer(User.Servicer):
             )
 
         bet_id = str(uuid4())
-        self.state.balance -= request.stake
         await Bet.create(
             context,
             bet_id,
@@ -463,7 +383,7 @@ class UserServicer(User.Servicer):
             audit_index_id=market.audit_index_id,
             actor_user_id=user_id,
             event_type="bet_placed",
-            message=f"{user_id} placed {request.stake} credits on {outcome}.",
+            message=f"{user_id} recorded {request.stake} credits on {outcome}.",
             bet_id=bet_id,
         )
 
@@ -474,6 +394,9 @@ class UserServicer(User.Servicer):
         context: TransactionContext,
         request: User.ResolveMarketRequest,
     ) -> User.ResolveMarketResponse:
+        # Skeleton only: records the winning outcome on the market. Tallying
+        # winners/losers and spawning payouts is resolution behavior owned
+        # by a later slice and is intentionally not performed here.
         user_id = self.ref().state_id
         _require_signed_in_user(context, user_id, User.ResolveMarketAborted)
 
@@ -501,63 +424,19 @@ class UserServicer(User.Servicer):
             context,
             winning_outcome=winning_outcome,
         )
-
-        bet_ids, _ = await _read_ids(
-            context,
-            market.bet_index_id,
-            limit=PAGE_LIMIT_MAX,
-        )
-        winner_count = 0
-        loser_count = 0
-        payout_count = 0
-        for bet_id in bet_ids:
-            bet = await Bet.ref(bet_id).get(context)
-            if bet.outcome != winning_outcome:
-                loser_count += 1
-                await Bet.ref(bet_id).set_status(context, status=BET_LOST)
-                continue
-
-            winner_count += 1
-            payout_count += 1
-            payment_intent_id = str(uuid4())
-            payout_amount = bet.stake * 2
-            await PaymentIntent.create(
-                context,
-                payment_intent_id,
-                user_id=bet.user_id,
-                market_id=request.market_id,
-                bet_id=bet_id,
-                amount=payout_amount,
-            )
-            await Bet.ref(bet_id).mark_won(
-                context,
-                payout_amount=payout_amount,
-                payment_intent_id=payment_intent_id,
-            )
-            await User.ref(bet.user_id).add_payment(
-                context,
-                payment_intent_id=payment_intent_id,
-            )
-            await Market.ref(request.market_id).record_payout_pending(
-                context,
-                payment_intent_id=payment_intent_id,
-            )
-            await PaymentIntent.ref(payment_intent_id).schedule().run(context)
-
-        resolved_market = await Market.ref(request.market_id).get(context)
         await _append_audit(
             context,
             market_id=request.market_id,
-            audit_index_id=resolved_market.audit_index_id,
+            audit_index_id=market.audit_index_id,
             actor_user_id=user_id,
             event_type="market_resolved",
             message=f"Market resolved as {winning_outcome}.",
         )
 
         return User.ResolveMarketResponse(
-            winner_count=winner_count,
-            loser_count=loser_count,
-            payout_count=payout_count,
+            winner_count=0,
+            loser_count=0,
+            payout_count=0,
         )
 
     async def close_market(
@@ -573,7 +452,7 @@ class UserServicer(User.Servicer):
             raise User.CloseMarketAborted(
                 _prediction_error("permission_denied", "Only the market creator can close it.")
             )
-        if market.status in {MARKET_RESOLVED, MARKET_REVIEW_REQUIRED}:
+        if market.status == MARKET_RESOLVED:
             raise User.CloseMarketAborted(
                 _prediction_error("market_final", "Resolved markets cannot be closed again.")
             )
@@ -608,7 +487,7 @@ class UserServicer(User.Servicer):
             cursor=request.cursor,
             limit=request.limit,
         )
-        events = [
+        events: list[AuditEventSummary] = [
             await AuditEvent.ref(audit_id).get(context)
             for audit_id in audit_ids
         ]
@@ -619,6 +498,8 @@ class UserServicer(User.Servicer):
         context: WriterContext,
         request: User.ApplyPayoutRequest,
     ) -> None:
+        # Skeleton only: available for a future payment slice to call once
+        # it spawns payouts. Nothing in this slice invokes it.
         if request.payment_intent_id in self.state.settled_payment_intent_ids:
             return
         self.state.balance += request.amount
@@ -738,6 +619,8 @@ class MarketServicer(Market.Servicer):
         context: WriterContext,
         request: Market.RecordPayoutPendingRequest,
     ) -> None:
+        # Skeleton only: available for a future payment slice to call when
+        # it spawns payouts. Nothing in this slice invokes it.
         self.state.payout_pending_count += 1
 
     async def record_payout_succeeded(
@@ -763,7 +646,7 @@ class MarketServicer(Market.Servicer):
         context: WriterContext,
         request: Market.MarkReviewRequiredRequest,
     ) -> None:
-        self.state.status = MARKET_REVIEW_REQUIRED
+        self.state.status = "review_required"
 
 
 class BetServicer(Bet.Servicer):
@@ -799,7 +682,8 @@ class BetServicer(Bet.Servicer):
         context: WriterContext,
         request: Bet.MarkWonRequest,
     ) -> None:
-        self.state.status = BET_WON_PENDING
+        # Skeleton only: available for a future resolution slice to call.
+        self.state.status = "won_pending"
         self.state.payout_amount = request.payout_amount
         self.state.payment_intent_id = request.payment_intent_id
 
@@ -847,7 +731,9 @@ class PaymentIntentServicer(PaymentIntent.Servicer):
         context: WriterContext,
         request: PaymentIntent.RecordAttemptRequest,
     ) -> None:
-        self.state.status = PAYMENT_RUNNING
+        # Skeleton only: available for a future payment slice to call. No
+        # payment gateway is wired up in this slice.
+        self.state.status = "running"
         self.state.failure_class = request.failure_class
         self.state.attempts.append(
             PaymentAttempt(
@@ -873,172 +759,8 @@ class PaymentIntentServicer(PaymentIntent.Servicer):
         context: WriterContext,
         request: PaymentIntent.RecordSuccessRequest,
     ) -> None:
-        self.state.status = PAYMENT_SUCCEEDED
+        self.state.status = "succeeded"
         self.state.failure_class = ""
-
-    @classmethod
-    async def run(cls, context: WorkflowContext) -> None:
-        payment_intent_id = context.state_id
-        payment = await PaymentIntent.ref(payment_intent_id).per_workflow(
-            "Load payment intent"
-        ).get(context)
-        if payment.status in {PAYMENT_SUCCEEDED, PAYMENT_RETRY_EXHAUSTED, PAYMENT_FAILED}:
-            return
-
-        market = await Market.ref(payment.market_id).per_workflow(
-            "Load payout market"
-        ).get(context)
-
-        for attempt_number in range(1, 4):
-            async def call_gateway() -> str:
-                outcome = await gateway_charge(
-                    payment_intent_id,
-                    payment.amount,
-                    payment.idempotency_key,
-                    attempt_number,
-                )
-                return "|".join(
-                    [
-                        outcome.status,
-                        outcome.failure_class,
-                        outcome.provider_transaction_id,
-                        outcome.message,
-                    ]
-                )
-
-            raw_result = await at_least_once(
-                f"Simulated gateway attempt {attempt_number}",
-                context,
-                call_gateway,
-            )
-            status, failure_class, provider_transaction_id, message = (
-                raw_result.split("|", 3)
-            )
-            await PaymentIntent.ref().per_workflow(
-                f"Record gateway attempt {attempt_number}"
-            ).record_attempt(
-                context,
-                attempt_number=attempt_number,
-                status=status,
-                failure_class=failure_class,
-                provider_transaction_id=provider_transaction_id,
-                message=message,
-            )
-
-            if status == "success":
-                await User.ref(payment.user_id).per_workflow(
-                    "Apply winner credit"
-                ).apply_payout(
-                    context,
-                    payment_intent_id=payment_intent_id,
-                    amount=payment.amount,
-                )
-                await Bet.ref(payment.bet_id).per_workflow(
-                    "Mark winning bet paid"
-                ).set_status(
-                    context,
-                    status=BET_WON_PAID,
-                )
-                await Market.ref(payment.market_id).per_workflow(
-                    "Record payout success"
-                ).record_payout_succeeded(
-                    context,
-                    payment_intent_id=payment_intent_id,
-                )
-                await _append_audit(
-                    context,
-                    market_id=payment.market_id,
-                    audit_index_id=market.audit_index_id,
-                    actor_user_id=payment.user_id,
-                    event_type="payout_succeeded",
-                    message=f"Paid {payment.amount} credits.",
-                    bet_id=payment.bet_id,
-                    payment_intent_id=payment_intent_id,
-                    workflow_alias_prefix="success",
-                )
-                await PaymentIntent.ref().per_workflow(
-                    "Mark payment succeeded"
-                ).record_success(
-                    context,
-                    provider_transaction_id=provider_transaction_id,
-                )
-                return
-
-            if status == "permanent_failure":
-                await Bet.ref(payment.bet_id).per_workflow(
-                    "Mark winning bet payment failed"
-                ).set_status(
-                    context,
-                    status=BET_PAYMENT_FAILED,
-                )
-                await Market.ref(payment.market_id).per_workflow(
-                    "Record payout failure"
-                ).record_payout_failed(
-                    context,
-                    payment_intent_id=payment_intent_id,
-                )
-                await Market.ref(payment.market_id).per_workflow(
-                    "Mark market review required"
-                ).mark_review_required(
-                    context,
-                    payment_intent_id=payment_intent_id,
-                )
-                await _append_audit(
-                    context,
-                    market_id=payment.market_id,
-                    audit_index_id=market.audit_index_id,
-                    actor_user_id=payment.user_id,
-                    event_type="payout_failed",
-                    message=message or "Payment failed permanently.",
-                    bet_id=payment.bet_id,
-                    payment_intent_id=payment_intent_id,
-                    workflow_alias_prefix="permanent-failure",
-                )
-                await PaymentIntent.ref().per_workflow(
-                    "Mark payment failed"
-                ).record_status(
-                    context,
-                    status=PAYMENT_FAILED,
-                    failure_class=failure_class,
-                )
-                return
-
-        await Bet.ref(payment.bet_id).per_workflow(
-            "Mark winning bet retry exhausted"
-        ).set_status(
-            context,
-            status=BET_PAYMENT_FAILED,
-        )
-        await Market.ref(payment.market_id).per_workflow(
-            "Record retry exhaustion"
-        ).record_payout_failed(
-            context,
-            payment_intent_id=payment_intent_id,
-        )
-        await Market.ref(payment.market_id).per_workflow(
-            "Mark review after exhaustion"
-        ).mark_review_required(
-            context,
-            payment_intent_id=payment_intent_id,
-        )
-        await _append_audit(
-            context,
-            market_id=payment.market_id,
-            audit_index_id=market.audit_index_id,
-            actor_user_id=payment.user_id,
-            event_type="payout_retry_exhausted",
-            message="Payment retry budget exhausted.",
-            bet_id=payment.bet_id,
-            payment_intent_id=payment_intent_id,
-            workflow_alias_prefix="retry-exhausted",
-        )
-        await PaymentIntent.ref().per_workflow(
-            "Mark payment retry exhausted"
-        ).record_status(
-            context,
-            status=PAYMENT_RETRY_EXHAUSTED,
-            failure_class="retry_exhausted",
-        )
 
 
 class AuditEventServicer(AuditEvent.Servicer):

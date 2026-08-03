@@ -8,7 +8,6 @@ from reboot.api import (
     Transaction,
     Type,
     UI,
-    Workflow,
     Writer,
 )
 
@@ -491,11 +490,6 @@ PaymentIntentMethods = Methods(
     ),
     record_success=Writer(
         request=PaymentIntentRecordSuccessRequest,
-        response=None,
-        mcp=None,
-    ),
-    run=Workflow(
-        request=None,
         response=None,
         mcp=None,
     ),
