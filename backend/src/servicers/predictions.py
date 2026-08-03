@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
+import uuid
 
-from predictions.v1.predictions import PaymentAttempt
+from rbt.v1alpha1 import errors_pb2
+
+from predictions.v1.predictions import (
+    AuditEventSummary,
+    MarketSummary,
+    PaymentAttempt,
+)
 from predictions.v1.predictions_rbt import (
     AuditEvent,
     Bet,
@@ -12,11 +20,16 @@ from predictions.v1.predictions_rbt import (
     User,
 )
 from reboot.aio.contexts import ReaderContext, TransactionContext, WorkflowContext, WriterContext
+from reboot.aio.aborted import Aborted
 from reboot.std.collections.ordered_map.v1.ordered_map import OrderedMap
 
 
 INITIAL_CREDITS = 0
 CATALOG_MARKET_INDEX_ID = "catalog:markets"
+DEFAULT_PAGE_LIMIT = 50
+MAX_PAGE_LIMIT = 100
+OPEN_STATUS = "open"
+CLOSED_STATUS = "closed"
 
 
 @dataclass(frozen=True)
@@ -55,6 +68,61 @@ def _market_audit_index_id(market_id: str) -> str:
     return f"market:{market_id}:audit"
 
 
+def _page_limit(requested: int) -> int:
+    if requested <= 0:
+        return DEFAULT_PAGE_LIMIT
+    return min(requested, MAX_PAGE_LIMIT)
+
+
+def _decode_id(value: bytes) -> str:
+    return value.decode()
+
+
+def _market_summary(record: Market.GetResponse) -> MarketSummary:
+    return MarketSummary(
+        market_id=record.market_id,
+        creator_user_id=record.creator_user_id,
+        question=record.question,
+        status=record.status,
+        close_after_seconds=record.close_after_seconds,
+        winning_outcome=record.winning_outcome,
+        yes_total=record.yes_total,
+        no_total=record.no_total,
+        bet_count=record.bet_count,
+        payout_pending_count=record.payout_pending_count,
+        payout_succeeded_count=record.payout_succeeded_count,
+        payout_failed_count=record.payout_failed_count,
+    )
+
+
+def _audit_summary(record: AuditEvent.GetResponse) -> AuditEventSummary:
+    return AuditEventSummary(
+        audit_event_id=record.audit_event_id,
+        market_id=record.market_id,
+        actor_user_id=record.actor_user_id,
+        event_type=record.event_type,
+        message=record.message,
+        bet_id=record.bet_id,
+        payment_intent_id=record.payment_intent_id,
+        sequence=record.sequence,
+    )
+
+
+def _invalid_argument(message: str) -> errors_pb2.InvalidArgument:
+    del message
+    return errors_pb2.InvalidArgument()
+
+
+def _failed_precondition(message: str) -> errors_pb2.FailedPrecondition:
+    del message
+    return errors_pb2.FailedPrecondition()
+
+
+def _permission_denied(message: str) -> errors_pb2.PermissionDenied:
+    del message
+    return errors_pb2.PermissionDenied()
+
+
 async def _insert_id(
     context: TransactionContext,
     map_id: str,
@@ -66,6 +134,65 @@ async def _insert_id(
         key=key,
         bytes=value_id.encode(),
     )
+
+
+async def _ids_from_ordered_map(
+    context: ReaderContext,
+    map_id: str,
+    *,
+    cursor: str,
+    limit: int,
+) -> tuple[list[str], str]:
+    page_size = _page_limit(limit)
+    response = await OrderedMap.ref(map_id).range(
+        context,
+        start_key=cursor if cursor else None,
+        limit=page_size + 1,
+    )
+    returned = list(response.entries[:page_size])
+    next_cursor = response.entries[page_size].key if len(response.entries) > page_size else ""
+    return [_decode_id(entry.bytes) for entry in returned], next_cursor
+
+
+async def _append_audit_event(
+    context: TransactionContext,
+    *,
+    market_id: str,
+    sequence: int,
+    actor_user_id: str,
+    event_type: str,
+    message: str,
+    bet_id: str = "",
+    payment_intent_id: str = "",
+) -> None:
+    audit_event_id = f"{market_id}:audit:{sequence:020d}"
+    await AuditEvent.create(
+        context,
+        audit_event_id,
+        market_id=market_id,
+        actor_user_id=actor_user_id,
+        event_type=event_type,
+        message=message,
+        bet_id=bet_id,
+        payment_intent_id=payment_intent_id,
+        sequence=sequence,
+    )
+    await _insert_id(
+        context,
+        _market_audit_index_id(market_id),
+        f"{sequence:020d}",
+        audit_event_id,
+    )
+
+
+async def _market_summaries(
+    context: ReaderContext,
+    market_ids: list[str],
+) -> list[MarketSummary]:
+    summaries: list[MarketSummary] = []
+    for market_id in market_ids:
+        summaries.append(_market_summary(await Market.ref(market_id).get(context)))
+    return summaries
 
 
 class UserServicer(User.Servicer):
@@ -83,14 +210,23 @@ class UserServicer(User.Servicer):
         context: ReaderContext,
         request: User.DashboardRequest,
     ) -> User.DashboardResponse:
-        del context, request
+        try:
+            market_ids, next_cursor = await _ids_from_ordered_map(
+                context,
+                CATALOG_MARKET_INDEX_ID,
+                cursor=request.cursor,
+                limit=request.limit,
+            )
+        except Aborted:
+            market_ids = []
+            next_cursor = ""
         return User.DashboardResponse(
             user_id=self.ref().state_id,
             balance=self.state.balance,
-            markets=[],
+            markets=await _market_summaries(context, market_ids),
             bets=[],
             payments=[],
-            next_cursor="",
+            next_cursor=next_cursor,
         )
 
     async def create_market(
@@ -98,8 +234,50 @@ class UserServicer(User.Servicer):
         context: TransactionContext,
         request: User.CreateMarketRequest,
     ) -> User.CreateMarketResponse:
-        del context, request
-        return User.CreateMarketResponse(market_id="")
+        question = request.question.strip()
+        if question == "":
+            raise User.CreateMarketAborted(
+                _invalid_argument("question is required"),
+                message="question is required",
+            )
+        if request.close_after_seconds < 0:
+            raise User.CreateMarketAborted(
+                _invalid_argument("close_after_seconds must be non-negative"),
+                message="close_after_seconds must be non-negative",
+            )
+
+        user_id = self.ref().state_id
+        if self.state.created_market_index_id == "":
+            self.state.created_market_index_id = _user_created_market_index_id(user_id)
+
+        market_id = str(uuid.uuid4())
+        market_ref, _ = await Market.create(
+            context,
+            market_id,
+            creator_user_id=user_id,
+            question=question,
+            close_after_seconds=request.close_after_seconds,
+        )
+        await _insert_id(
+            context,
+            self.state.created_market_index_id,
+            market_id,
+            market_id,
+        )
+        await MarketCatalog.ref().add_market(context, market_id=market_id)
+        await _append_audit_event(
+            context,
+            market_id=market_id,
+            sequence=1,
+            actor_user_id=user_id,
+            event_type="market_created",
+            message="Market created.",
+        )
+        if request.close_after_seconds > 0:
+            await User.ref(user_id).schedule(
+                when=timedelta(seconds=request.close_after_seconds)
+            ).close_market(context, market_id=market_id)
+        return User.CreateMarketResponse(market_id=market_id)
 
     async def place_bet(
         self,
@@ -126,16 +304,52 @@ class UserServicer(User.Servicer):
         context: TransactionContext,
         request: User.CloseMarketRequest,
     ) -> User.CloseMarketResponse:
-        del context, request
-        return User.CloseMarketResponse(status="")
+        if request.market_id == "":
+            raise User.CloseMarketAborted(
+                _invalid_argument("market_id is required"),
+                message="market_id is required",
+            )
+        market = await Market.ref(request.market_id).get(context)
+        if market.creator_user_id != self.ref().state_id:
+            raise User.CloseMarketAborted(
+                _permission_denied("only the creator can close this market"),
+                message="only the creator can close this market",
+            )
+        if market.status == OPEN_STATUS:
+            await Market.ref(request.market_id).close_if_due(context)
+            await _append_audit_event(
+                context,
+                market_id=request.market_id,
+                sequence=2,
+                actor_user_id=self.ref().state_id,
+                event_type="market_closed",
+                message="Market closed.",
+            )
+        closed = await Market.ref(request.market_id).get(context)
+        return User.CloseMarketResponse(status=closed.status)
 
     async def audit_log(
         self,
         context: ReaderContext,
         request: User.AuditLogRequest,
     ) -> User.AuditLogResponse:
-        del context, request
-        return User.AuditLogResponse(events=[], next_cursor="")
+        if request.market_id == "":
+            raise User.AuditLogAborted(
+                _invalid_argument("market_id is required"),
+                message="market_id is required",
+            )
+        market = await Market.ref(request.market_id).get(context)
+        event_ids, next_cursor = await _ids_from_ordered_map(
+            context,
+            market.audit_index_id,
+            cursor=request.cursor,
+            limit=request.limit,
+        )
+        events = [
+            _audit_summary(await AuditEvent.ref(event_id).get(context))
+            for event_id in event_ids
+        ]
+        return User.AuditLogResponse(events=events, next_cursor=next_cursor)
 
     async def apply_payout(
         self,
@@ -201,7 +415,7 @@ class MarketServicer(Market.Servicer):
         market_id = self.ref().state_id
         self.state.creator_user_id = request.creator_user_id
         self.state.question = request.question
-        self.state.status = ""
+        self.state.status = OPEN_STATUS
         self.state.close_after_seconds = request.close_after_seconds
         self.state.winning_outcome = ""
         self.state.bet_index_id = _market_bet_index_id(market_id)
@@ -241,7 +455,9 @@ class MarketServicer(Market.Servicer):
         del context, request
 
     async def close_if_due(self, context: WriterContext) -> None:
-        del context
+        if self.state.status != OPEN_STATUS:
+            return
+        self.state.status = CLOSED_STATUS
 
     @classmethod
     async def spawn_payouts(cls, context: WorkflowContext) -> None:
@@ -252,7 +468,13 @@ class MarketServicer(Market.Servicer):
         context: WriterContext,
         request: Market.ResolveRequest,
     ) -> None:
-        del context, request
+        del context
+        if self.state.status != CLOSED_STATUS:
+            raise Market.ResolveAborted(
+                _failed_precondition("market must be closed before resolution"),
+                message="market must be closed before resolution",
+            )
+        self.state.winning_outcome = request.winning_outcome.strip().lower()
 
     async def record_payout_pending(
         self,
