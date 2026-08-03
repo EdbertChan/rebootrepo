@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 
-from predictions.v1.predictions import PaymentAttempt
+from predictions.v1.predictions import AuditEventSummary, MarketSummary, PaymentAttempt, PredictionError
 from predictions.v1.predictions_rbt import (
     AuditEvent,
     Bet,
@@ -11,12 +12,15 @@ from predictions.v1.predictions_rbt import (
     PaymentIntent,
     User,
 )
+from reboot.aio.aborted import Aborted
 from reboot.aio.contexts import ReaderContext, TransactionContext, WorkflowContext, WriterContext
 from reboot.std.collections.ordered_map.v1.ordered_map import OrderedMap
 
 
 INITIAL_CREDITS = 0
+CATALOG_ID = "catalog"
 CATALOG_MARKET_INDEX_ID = "catalog:markets"
+DEFAULT_PAGE_LIMIT = 50
 
 
 @dataclass(frozen=True)
@@ -55,6 +59,20 @@ def _market_audit_index_id(market_id: str) -> str:
     return f"market:{market_id}:audit"
 
 
+def _audit_event_id(market_id: str, sequence: int) -> str:
+    return f"{market_id}:audit:{sequence:020d}"
+
+
+def _audit_key(sequence: int, audit_event_id: str) -> str:
+    return f"{sequence:020d}:{audit_event_id}"
+
+
+def _page_limit(limit: int) -> int:
+    if limit <= 0:
+        return DEFAULT_PAGE_LIMIT
+    return min(limit, DEFAULT_PAGE_LIMIT)
+
+
 async def _insert_id(
     context: TransactionContext,
     map_id: str,
@@ -65,6 +83,62 @@ async def _insert_id(
         context,
         key=key,
         bytes=value_id.encode(),
+    )
+
+
+async def _range_ids(
+    context: ReaderContext,
+    map_id: str,
+    *,
+    cursor: str,
+    limit: int,
+) -> tuple[list[str], str]:
+    page_limit = _page_limit(limit)
+    try:
+        page = await OrderedMap.ref(map_id).range(
+            context,
+            start_key=cursor,
+            limit=page_limit + 1,
+        )
+    except Aborted:
+        return [], ""
+
+    entries = list(page.entries)
+    next_cursor = ""
+    if len(entries) > page_limit:
+        next_cursor = entries[page_limit - 1].key + "\0"
+        entries = entries[:page_limit]
+
+    return [entry.bytes.decode() for entry in entries], next_cursor
+
+
+def _market_summary(market: Market.GetResponse) -> MarketSummary:
+    return MarketSummary(
+        market_id=market.market_id,
+        creator_user_id=market.creator_user_id,
+        question=market.question,
+        status=market.status,
+        close_after_seconds=market.close_after_seconds,
+        winning_outcome=market.winning_outcome,
+        yes_total=market.yes_total,
+        no_total=market.no_total,
+        bet_count=market.bet_count,
+        payout_pending_count=market.payout_pending_count,
+        payout_succeeded_count=market.payout_succeeded_count,
+        payout_failed_count=market.payout_failed_count,
+    )
+
+
+def _audit_summary(event: AuditEvent.GetResponse) -> AuditEventSummary:
+    return AuditEventSummary(
+        audit_event_id=event.audit_event_id,
+        market_id=event.market_id,
+        actor_user_id=event.actor_user_id,
+        event_type=event.event_type,
+        message=event.message,
+        bet_id=event.bet_id,
+        payment_intent_id=event.payment_intent_id,
+        sequence=event.sequence,
     )
 
 
@@ -83,14 +157,23 @@ class UserServicer(User.Servicer):
         context: ReaderContext,
         request: User.DashboardRequest,
     ) -> User.DashboardResponse:
-        del context, request
+        market_ids, next_cursor = await _range_ids(
+            context,
+            CATALOG_MARKET_INDEX_ID,
+            cursor=request.cursor,
+            limit=request.limit,
+        )
+        markets = [
+            _market_summary(await Market.ref(market_id).get(context))
+            for market_id in market_ids
+        ]
         return User.DashboardResponse(
             user_id=self.ref().state_id,
             balance=self.state.balance,
-            markets=[],
+            markets=markets,
             bets=[],
             payments=[],
-            next_cursor="",
+            next_cursor=next_cursor,
         )
 
     async def create_market(
@@ -98,8 +181,85 @@ class UserServicer(User.Servicer):
         context: TransactionContext,
         request: User.CreateMarketRequest,
     ) -> User.CreateMarketResponse:
-        del context, request
-        return User.CreateMarketResponse(market_id="")
+        if request.question.strip() == "":
+            raise User.CreateMarketAborted(
+                PredictionError(
+                    code="invalid_question",
+                    message="Market question is required.",
+                )
+            )
+        if request.close_after_seconds < 0:
+            raise User.CreateMarketAborted(
+                PredictionError(
+                    code="invalid_close_after_seconds",
+                    message="Market close delay cannot be negative.",
+                )
+            )
+
+        user_id = self.ref().state_id
+        if self.state.created_market_index_id == "":
+            self.state.created_market_index_id = _user_created_market_index_id(user_id)
+
+        market_ref, _ = await Market.idempotently("market").Create(
+            context,
+            creator_user_id=user_id,
+            question=request.question.strip(),
+            close_after_seconds=request.close_after_seconds,
+        )
+        market_id = market_ref.state_id
+        await _insert_id(
+            context,
+            self.state.created_market_index_id,
+            market_id,
+            market_id,
+        )
+        catalog = await MarketCatalog.ref(CATALOG_ID).ensure(context)
+        await MarketCatalog.ref(CATALOG_ID).add_market(
+            context,
+            market_id=market_id,
+        )
+
+        created_audit_event_id = _audit_event_id(market_id, 1)
+        close_audit_event_id = _audit_event_id(market_id, 2)
+        await AuditEvent.create(
+            context,
+            created_audit_event_id,
+            market_id=market_id,
+            actor_user_id=user_id,
+            event_type="market_created",
+            message="Market created.",
+            sequence=1,
+        )
+        await AuditEvent.create(
+            context,
+            close_audit_event_id,
+            market_id=market_id,
+            actor_user_id=user_id,
+            event_type="market_close_scheduled",
+            message="Market close is scheduled.",
+            sequence=2,
+        )
+        audit_index_id = _market_audit_index_id(market_id)
+        await _insert_id(
+            context,
+            audit_index_id,
+            _audit_key(1, created_audit_event_id),
+            created_audit_event_id,
+        )
+        await _insert_id(
+            context,
+            audit_index_id,
+            _audit_key(2, close_audit_event_id),
+            close_audit_event_id,
+        )
+
+        if request.close_after_seconds > 0:
+            await market_ref.schedule(
+                when=timedelta(seconds=request.close_after_seconds)
+            ).close_if_due(context)
+
+        del catalog
+        return User.CreateMarketResponse(market_id=market_id)
 
     async def place_bet(
         self,
@@ -126,16 +286,34 @@ class UserServicer(User.Servicer):
         context: TransactionContext,
         request: User.CloseMarketRequest,
     ) -> User.CloseMarketResponse:
-        del context, request
-        return User.CloseMarketResponse(status="")
+        market = await Market.ref(request.market_id).get(context)
+        if market.creator_user_id != self.ref().state_id:
+            raise User.CloseMarketAborted(
+                PredictionError(
+                    code="not_market_creator",
+                    message="Only the market creator can close the market.",
+                )
+            )
+        await Market.ref(request.market_id).close_if_due(context)
+        closed = await Market.ref(request.market_id).get(context)
+        return User.CloseMarketResponse(status=closed.status)
 
     async def audit_log(
         self,
         context: ReaderContext,
         request: User.AuditLogRequest,
     ) -> User.AuditLogResponse:
-        del context, request
-        return User.AuditLogResponse(events=[], next_cursor="")
+        event_ids, next_cursor = await _range_ids(
+            context,
+            _market_audit_index_id(request.market_id),
+            cursor=request.cursor,
+            limit=request.limit,
+        )
+        events = [
+            _audit_summary(await AuditEvent.ref(event_id).get(context))
+            for event_id in event_ids
+        ]
+        return User.AuditLogResponse(events=events, next_cursor=next_cursor)
 
     async def apply_payout(
         self,
@@ -166,9 +344,12 @@ class MarketCatalogServicer(MarketCatalog.Servicer):
         self,
         context: TransactionContext,
     ) -> MarketCatalog.EnsureResponse:
-        del context
         if self.state.market_index_id == "":
             self.state.market_index_id = CATALOG_MARKET_INDEX_ID
+            await OrderedMap.ref(self.state.market_index_id).create(
+                context,
+                maintain_size=True,
+            )
         return MarketCatalog.EnsureResponse(
             market_index_id=self.state.market_index_id,
         )
@@ -201,7 +382,7 @@ class MarketServicer(Market.Servicer):
         market_id = self.ref().state_id
         self.state.creator_user_id = request.creator_user_id
         self.state.question = request.question
-        self.state.status = ""
+        self.state.status = "open"
         self.state.close_after_seconds = request.close_after_seconds
         self.state.winning_outcome = ""
         self.state.bet_index_id = _market_bet_index_id(market_id)
@@ -241,7 +422,17 @@ class MarketServicer(Market.Servicer):
         del context, request
 
     async def close_if_due(self, context: WriterContext) -> None:
-        del context
+        if self.state.status != "open":
+            return
+        self.state.status = "closed"
+        await AuditEvent.ref(_audit_event_id(self.ref().state_id, 2)).update(
+            context,
+            event_type="market_closed",
+            message="Market closed.",
+            bet_id="",
+            payment_intent_id="",
+            sequence=2,
+        )
 
     @classmethod
     async def spawn_payouts(cls, context: WorkflowContext) -> None:
