@@ -175,6 +175,40 @@ button {
   font-weight: 750;
 }
 
+.pm-tabs {
+  border-bottom: 1px solid #e4e9ee;
+  display: flex;
+  gap: 4px;
+  padding: 8px 10px;
+}
+
+.pm-tabs button {
+  min-height: 32px;
+  border-radius: 6px;
+  background: transparent;
+  color: #607086;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 750;
+  text-transform: capitalize;
+}
+
+.pm-tabs button.active {
+  background: #eef2f4;
+  color: #1b2430;
+}
+
+.pm-tabs button em {
+  color: inherit;
+  font-size: 11px;
+  font-style: normal;
+  opacity: 0.7;
+}
+
 .pm-create {
   padding-bottom: 14px;
 }
