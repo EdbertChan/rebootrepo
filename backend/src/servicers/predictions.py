@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
+from time import time_ns
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
@@ -126,7 +127,10 @@ def _market_audit_index_id(market_id: str) -> str:
 
 
 def _map_key(prefix: str) -> str:
-    return f"{prefix}:{uuid4()}"
+    # `time_ns` keeps entries within an index sorted in insertion order, so
+    # listings (dashboards, audit logs) read back chronologically instead of
+    # in the random order a bare UUID key would produce.
+    return f"{prefix}:{time_ns():020d}:{uuid4()}"
 
 
 def _decode_entry_id(entry: Any) -> str:
