@@ -223,6 +223,10 @@ class MarketRecordPayoutRequest(Model):
     payment_intent_id: str = Field(tag=1, default="")
 
 
+class MarketNextAuditSequenceResponse(Model):
+    sequence: int = Field(tag=1, default=0)
+
+
 class BetState(Model):
     user_id: str = Field(tag=1, default="")
     market_id: str = Field(tag=2, default="")
@@ -437,6 +441,11 @@ MarketMethods = Methods(
     mark_review_required=Writer(
         request=MarketRecordPayoutRequest,
         response=None,
+        mcp=None,
+    ),
+    next_audit_sequence=Writer(
+        request=None,
+        response=MarketNextAuditSequenceResponse,
         mcp=None,
     ),
 )
