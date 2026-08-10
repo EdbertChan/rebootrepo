@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
+from time import time_ns
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
@@ -87,6 +88,26 @@ def reset_gateway_for_tests() -> None:
     gateway_charge = _default_gateway_charge
 
 
+PayoutBarrier = Callable[[str], Awaitable[None]]
+
+
+async def _default_payout_barrier(checkpoint: str) -> None:
+    return None
+
+
+payout_barrier: PayoutBarrier = _default_payout_barrier
+
+
+def configure_payout_barrier_for_tests(barrier: PayoutBarrier) -> None:
+    global payout_barrier
+    payout_barrier = barrier
+
+
+def reset_payout_barrier_for_tests() -> None:
+    global payout_barrier
+    payout_barrier = _default_payout_barrier
+
+
 def _prediction_error(code: str, message: str) -> PredictionError:
     return PredictionError(code=code, message=message)
 
@@ -126,7 +147,10 @@ def _market_audit_index_id(market_id: str) -> str:
 
 
 def _map_key(prefix: str) -> str:
-    return f"{prefix}:{uuid4()}"
+    # `time_ns` keeps entries within an index sorted in insertion order, so
+    # listings (dashboards, audit logs) read back chronologically instead of
+    # in the random order a bare UUID key would produce.
+    return f"{prefix}:{time_ns():020d}:{uuid4()}"
 
 
 def _decode_entry_id(entry: Any) -> str:
@@ -195,6 +219,15 @@ async def _insert_id(
     )
 
 
+def _sequenced_audit_key(sequence: int, event_id: str) -> str:
+    # A market-scoped, monotonically increasing sequence number (rather than
+    # a wall-clock timestamp) keeps the audit index chronologically sorted
+    # even for events appended from a workflow: workflow calls must be
+    # deterministic across replays, and `time_ns()` is not, so a durable
+    # per-market counter is the only safe ordering key in that context.
+    return f"{sequence:020d}:{event_id}"
+
+
 async def _append_audit(
     context: TransactionContext | WorkflowContext,
     *,
@@ -210,9 +243,10 @@ async def _append_audit(
     event_id = str(uuid4()) if workflow_alias_prefix == "" else (
         f"{payment_intent_id}:{event_type}:{workflow_alias_prefix}"
     )
-    key = _map_key("audit") if workflow_alias_prefix == "" else event_id
 
     if workflow_alias_prefix == "":
+        sequence_response = await Market.ref(market_id).next_audit_sequence(context)
+        key = _sequenced_audit_key(sequence_response.sequence, event_id)
         await AuditEvent.create(
             context,
             event_id,
@@ -222,10 +256,15 @@ async def _append_audit(
             message=message,
             bet_id=bet_id,
             payment_intent_id=payment_intent_id,
-            sequence=0,
+            sequence=sequence_response.sequence,
         )
         await _insert_id(context, audit_index_id, key, event_id)
         return event_id
+
+    sequence_response = await Market.ref(market_id).per_workflow(
+        f"Sequence audit event {workflow_alias_prefix}"
+    ).next_audit_sequence(context)
+    key = _sequenced_audit_key(sequence_response.sequence, event_id)
 
     await AuditEvent.per_workflow(
         f"Create audit event {workflow_alias_prefix}"
@@ -238,7 +277,7 @@ async def _append_audit(
         message=message,
         bet_id=bet_id,
         payment_intent_id=payment_intent_id,
-        sequence=0,
+        sequence=sequence_response.sequence,
     )
     await OrderedMap.ref(audit_index_id).per_workflow(
         f"Index audit event {workflow_alias_prefix}"
@@ -765,6 +804,13 @@ class MarketServicer(Market.Servicer):
     ) -> None:
         self.state.status = MARKET_REVIEW_REQUIRED
 
+    async def next_audit_sequence(
+        self,
+        context: WriterContext,
+    ) -> Market.NextAuditSequenceResponse:
+        self.state.audit_sequence += 1
+        return Market.NextAuditSequenceResponse(sequence=self.state.audit_sequence)
+
 
 class BetServicer(Bet.Servicer):
     async def create(
@@ -924,8 +970,25 @@ class PaymentIntentServicer(PaymentIntent.Servicer):
                 provider_transaction_id=provider_transaction_id,
                 message=message,
             )
+            await _append_audit(
+                context,
+                market_id=payment.market_id,
+                audit_index_id=market.audit_index_id,
+                actor_user_id=payment.user_id,
+                event_type="payout_attempted",
+                message=f"Attempt {attempt_number}: gateway returned {status}.",
+                bet_id=payment.bet_id,
+                payment_intent_id=payment_intent_id,
+                workflow_alias_prefix=f"attempted-{attempt_number}",
+            )
 
             if status == "success":
+                # Test-only hook: lets tests stall replay exactly between the
+                # durably-recorded gateway confirmation and credit
+                # application, to prove a crash there resumes without
+                # re-invoking the gateway and without double-crediting.
+                # Production default is a no-op.
+                await payout_barrier(f"before-credit:{payment_intent_id}")
                 await User.ref(payment.user_id).per_workflow(
                     "Apply winner credit"
                 ).apply_payout(

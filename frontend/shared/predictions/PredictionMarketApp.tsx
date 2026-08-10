@@ -29,6 +29,9 @@ type AuditResult = NonNullable<ReturnType<UseUserApi["useAuditLog"]>["response"]
 type AuditEvent = AuditResult["events"][number];
 type Surface = "web" | "mcp";
 type Outcome = "YES" | "NO";
+type MarketTab = "open" | "closed" | "resolved";
+
+const MARKET_TABS: MarketTab[] = ["open", "closed", "resolved"];
 type AbortedLike = {
   error?: { code?: string; message?: string; type?: string };
   message?: string;
@@ -109,6 +112,7 @@ function PredictionWorkspace({
   const [question, setQuestion] = useState("");
   const [closeAfterSeconds, setCloseAfterSeconds] = useState(0);
   const [selectedMarketId, setSelectedMarketId] = useState("");
+  const [marketTab, setMarketTab] = useState<MarketTab>("open");
   const [error, setError] = useState("");
   const [isCreating, setIsCreating] = useState(false);
 
@@ -118,6 +122,10 @@ function PredictionWorkspace({
   const selectedMarket = useMemo(
     () => markets.find((market) => market.marketId === selectedMarketId),
     [markets, selectedMarketId],
+  );
+  const marketsByTab = useMemo(
+    () => markets.filter((market) => market.status === marketTab),
+    [markets, marketTab],
   );
   const openMarkets = markets.filter((market) => market.status === "open").length;
   const exposure = bets
@@ -226,10 +234,25 @@ function PredictionWorkspace({
           <div className="pm-panel">
             <div className="pm-panel-head">
               <h2>Markets</h2>
-              <span>{markets.length}</span>
+              <span>{marketsByTab.length}</span>
+            </div>
+            <div className="pm-tabs" role="tablist" aria-label="Market status">
+              {MARKET_TABS.map((tab) => (
+                <button
+                  key={tab}
+                  type="button"
+                  role="tab"
+                  aria-selected={tab === marketTab}
+                  className={tab === marketTab ? "active" : ""}
+                  onClick={() => setMarketTab(tab)}
+                >
+                  {formatStatus(tab)}
+                  <em>{markets.filter((market) => market.status === tab).length}</em>
+                </button>
+              ))}
             </div>
             <div className="pm-market-list">
-              {markets.map((market) => (
+              {marketsByTab.map((market) => (
                 <MarketRow
                   key={market.marketId}
                   market={market}
@@ -240,10 +263,10 @@ function PredictionWorkspace({
                   onError={setError}
                 />
               ))}
-              {markets.length === 0 && (
+              {marketsByTab.length === 0 && (
                 <div className="pm-empty">
                   <Scale size={20} />
-                  <span>No markets</span>
+                  <span>No {formatStatus(marketTab)} markets</span>
                 </div>
               )}
             </div>

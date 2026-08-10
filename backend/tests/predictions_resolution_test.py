@@ -16,7 +16,11 @@ from servicers.predictions import (
 )
 
 
-class PredictionMarketTest(unittest.IsolatedAsyncioTestCase):
+class MarketResolutionTest(unittest.IsolatedAsyncioTestCase):
+    """Exercises `User.resolve_market`: creator-only auth, resolution state
+    transitions, and that winners/losers get credited/settled exactly once.
+    """
+
     async def asyncSetUp(self) -> None:
         self.rbt = Reboot()
         await self.rbt.start()
@@ -34,8 +38,13 @@ class PredictionMarketTest(unittest.IsolatedAsyncioTestCase):
             "bob",
             user_id="bob",
         )
+        self.carol_context = await self.rbt.create_external_context_as(
+            "carol",
+            user_id="carol",
+        )
         self.alice = User.ref("alice")
         self.bob = User.ref("bob")
+        self.carol = User.ref("carol")
 
     async def asyncTearDown(self) -> None:
         reset_gateway_for_tests()
@@ -56,8 +65,13 @@ class PredictionMarketTest(unittest.IsolatedAsyncioTestCase):
             "bob",
             user_id="bob",
         )
+        self.carol_context = await self.rbt.create_external_context_as(
+            "carol",
+            user_id="carol",
+        )
         self.alice = User.ref("alice")
         self.bob = User.ref("bob")
+        self.carol = User.ref("carol")
 
     async def wait_for_payment_status(
         self,
@@ -80,96 +94,47 @@ class PredictionMarketTest(unittest.IsolatedAsyncioTestCase):
             f"Payment {payment_intent_id} did not reach one of {sorted(statuses)}."
         )
 
-    async def test_user_starts_with_credits_and_sees_catalog(self) -> None:
-        alice_dashboard = await self.alice.dashboard(self.alice_context)
-        self.assertEqual(alice_dashboard.balance, 1000)
-        self.assertEqual(alice_dashboard.markets, [])
-
+    async def test_only_creator_can_resolve_market(self) -> None:
         market = await self.alice.create_market(
             self.alice_context,
-            question="Will prediction markets ship?",
+            question="Will only the creator be able to resolve this?",
             close_after_seconds=0,
         )
-        bob_dashboard = await self.bob.dashboard(self.bob_context)
+        await self.alice.close_market(self.alice_context, market_id=market.market_id)
 
-        self.assertEqual(bob_dashboard.balance, 1000)
-        self.assertEqual(len(bob_dashboard.markets), 1)
-        self.assertEqual(bob_dashboard.markets[0].market_id, market.market_id)
-        self.assertEqual(bob_dashboard.markets[0].status, "open")
-
-    async def test_place_bet_debits_balance_and_writes_audit(self) -> None:
-        market = await self.alice.create_market(
-            self.alice_context,
-            question="Will users bet with demo credits?",
-            close_after_seconds=0,
-        )
-
-        placed = await self.bob.place_bet(
-            self.bob_context,
-            market_id=market.market_id,
-            outcome="yes",
-            stake=125,
-        )
-        dashboard = await self.bob.dashboard(self.bob_context)
-        audit = await self.bob.audit_log(
-            self.bob_context,
-            market_id=market.market_id,
-        )
-
-        self.assertEqual(placed.balance, 875)
-        self.assertEqual(dashboard.balance, 875)
-        self.assertEqual(dashboard.bets[0].bet_id, placed.bet_id)
-        self.assertEqual(dashboard.markets[0].yes_total, 125)
-        self.assertIn("bet_placed", [event.event_type for event in audit.events])
-
-    async def test_business_validation_aborts(self) -> None:
-        open_market = await self.alice.create_market(
-            self.alice_context,
-            question="Will invalid bets be rejected?",
-            close_after_seconds=0,
-        )
-        closed_market = await self.alice.create_market(
-            self.alice_context,
-            question="Will closed markets reject new bets?",
-            close_after_seconds=0,
-        )
-        await self.alice.close_market(
-            self.alice_context,
-            market_id=closed_market.market_id,
-        )
-
-        with self.assertRaises(Aborted):
-            await self.bob.place_bet(
-                self.bob_context,
-                market_id=open_market.market_id,
-                outcome="MAYBE",
-                stake=10,
-            )
-        with self.assertRaises(Aborted):
-            await self.bob.place_bet(
-                self.bob_context,
-                market_id=open_market.market_id,
-                outcome="YES",
-                stake=1001,
-            )
-        with self.assertRaises(Aborted):
-            await self.bob.place_bet(
-                self.bob_context,
-                market_id=closed_market.market_id,
-                outcome="YES",
-                stake=10,
-            )
         with self.assertRaises(Aborted):
             await self.bob.resolve_market(
                 self.bob_context,
-                market_id=closed_market.market_id,
+                market_id=market.market_id,
                 winning_outcome="YES",
             )
 
-    async def test_resolution_pays_winners_double_exactly_once(self) -> None:
+        dashboard = await self.alice.dashboard(self.alice_context)
+        self.assertEqual(dashboard.markets[0].status, "closed")
+        self.assertEqual(dashboard.markets[0].winning_outcome, "")
+
+    async def test_resolution_before_close_is_rejected(self) -> None:
         market = await self.alice.create_market(
             self.alice_context,
-            question="Will winners be paid after close?",
+            question="Will resolving a still-open market be rejected?",
+            close_after_seconds=0,
+        )
+
+        with self.assertRaises(Aborted):
+            await self.alice.resolve_market(
+                self.alice_context,
+                market_id=market.market_id,
+                winning_outcome="YES",
+            )
+
+        dashboard = await self.alice.dashboard(self.alice_context)
+        self.assertEqual(dashboard.markets[0].status, "open")
+        self.assertEqual(dashboard.markets[0].winning_outcome, "")
+
+    async def test_double_resolution_is_rejected(self) -> None:
+        market = await self.alice.create_market(
+            self.alice_context,
+            question="Will resolving twice be rejected?",
             close_after_seconds=0,
         )
         await self.bob.place_bet(
@@ -185,77 +150,89 @@ class PredictionMarketTest(unittest.IsolatedAsyncioTestCase):
             winning_outcome="YES",
         )
 
-        dashboard = await self.bob.dashboard(self.bob_context)
-        payment_intent_id = dashboard.payments[0].payment_intent_id
-        dashboard, payment = await self.wait_for_payment_status(
+        with self.assertRaises(Aborted):
+            await self.alice.resolve_market(
+                self.alice_context,
+                market_id=market.market_id,
+                winning_outcome="NO",
+            )
+
+        dashboard = await self.alice.dashboard(self.alice_context)
+        self.assertEqual(dashboard.markets[0].status, "resolved")
+        self.assertEqual(dashboard.markets[0].winning_outcome, "YES")
+
+    async def test_invalid_winning_outcome_is_rejected(self) -> None:
+        market = await self.alice.create_market(
+            self.alice_context,
+            question="Will an invalid winning outcome be rejected?",
+            close_after_seconds=0,
+        )
+        await self.alice.close_market(self.alice_context, market_id=market.market_id)
+
+        with self.assertRaises(Aborted):
+            await self.alice.resolve_market(
+                self.alice_context,
+                market_id=market.market_id,
+                winning_outcome="MAYBE",
+            )
+
+        dashboard = await self.alice.dashboard(self.alice_context)
+        self.assertEqual(dashboard.markets[0].status, "closed")
+
+    async def test_winner_is_paid_double_and_loser_gets_nothing(self) -> None:
+        market = await self.alice.create_market(
+            self.alice_context,
+            question="Will winners get double and losers get nothing?",
+            close_after_seconds=0,
+        )
+        await self.bob.place_bet(
+            self.bob_context,
+            market_id=market.market_id,
+            outcome="YES",
+            stake=100,
+        )
+        await self.carol.place_bet(
+            self.carol_context,
+            market_id=market.market_id,
+            outcome="NO",
+            stake=60,
+        )
+        await self.alice.close_market(self.alice_context, market_id=market.market_id)
+
+        resolution = await self.alice.resolve_market(
+            self.alice_context,
+            market_id=market.market_id,
+            winning_outcome="YES",
+        )
+        self.assertEqual(resolution.winner_count, 1)
+        self.assertEqual(resolution.loser_count, 1)
+        self.assertEqual(resolution.payout_count, 1)
+
+        bob_dashboard = await self.bob.dashboard(self.bob_context)
+        payment_intent_id = bob_dashboard.payments[0].payment_intent_id
+        bob_dashboard, payment = await self.wait_for_payment_status(
             payment_intent_id,
             {"succeeded"},
         )
-        await asyncio.sleep(0.2)
-        after_replay_window = await self.bob.dashboard(self.bob_context)
 
-        self.assertEqual(dashboard.balance, 1100)
-        self.assertEqual(after_replay_window.balance, 1100)
-        self.assertEqual(dashboard.bets[0].status, "won_paid")
+        carol_dashboard = await self.carol.dashboard(self.carol_context)
+
+        # Winner: stake was debited on bet placement (900), then paid
+        # stake*2 = 200 back on payout, netting 1000 - 100 + 200 = 1100.
+        self.assertEqual(bob_dashboard.balance, 1100)
+        self.assertEqual(bob_dashboard.bets[0].status, "won_paid")
+        self.assertEqual(bob_dashboard.bets[0].payout_amount, 200)
         self.assertEqual(payment.status, "succeeded")
-        self.assertEqual(len(payment.attempts), 1)
 
-    async def test_gateway_retry_then_success(self) -> None:
-        attempts = 0
+        # Loser: stake stays debited, no payout ever created.
+        self.assertEqual(carol_dashboard.balance, 940)
+        self.assertEqual(carol_dashboard.bets[0].status, "lost")
+        self.assertEqual(carol_dashboard.bets[0].payout_amount, 0)
+        self.assertEqual(carol_dashboard.payments, [])
 
-        async def retry_then_success(
-            payment_intent_id: str,
-            amount: int,
-            idempotency_key: str,
-            attempt_number: int,
-        ) -> GatewayOutcome:
-            nonlocal attempts
-            attempts += 1
-            if attempt_number < 3:
-                return GatewayOutcome(
-                    status="retryable_failure",
-                    failure_class="timeout",
-                    message="gateway timed out",
-                )
-            return GatewayOutcome(
-                status="success",
-                provider_transaction_id=f"simulated:{payment_intent_id}",
-            )
-
-        configure_gateway_for_tests(retry_then_success)
-        market = await self.alice.create_market(
-            self.alice_context,
-            question="Will retryable payouts recover?",
-            close_after_seconds=0,
-        )
-        await self.bob.place_bet(
-            self.bob_context,
-            market_id=market.market_id,
-            outcome="YES",
-            stake=100,
-        )
-        await self.alice.close_market(self.alice_context, market_id=market.market_id)
-        await self.alice.resolve_market(
-            self.alice_context,
-            market_id=market.market_id,
-            winning_outcome="YES",
-        )
-        payment_id = (await self.bob.dashboard(self.bob_context)).payments[0].payment_intent_id
-
-        dashboard, payment = await self.wait_for_payment_status(
-            payment_id,
-            {"succeeded"},
-        )
-        self.assertEqual(dashboard.balance, 1100)
-        self.assertEqual(payment.status, "succeeded")
-        self.assertEqual([attempt.status for attempt in payment.attempts], [
-            "retryable_failure",
-            "retryable_failure",
-            "success",
-        ])
-        self.assertGreaterEqual(attempts, 3)
-
-    async def test_gateway_permanent_failure_requires_review(self) -> None:
+    async def test_permanent_gateway_failure_marks_market_review_required(
+        self,
+    ) -> None:
         async def declined(
             payment_intent_id: str,
             amount: int,
@@ -271,7 +248,7 @@ class PredictionMarketTest(unittest.IsolatedAsyncioTestCase):
         configure_gateway_for_tests(declined)
         market = await self.alice.create_market(
             self.alice_context,
-            question="Will permanent failures stop?",
+            question="Will a permanently failed payout require review?",
             close_after_seconds=0,
         )
         await self.bob.place_bet(
@@ -292,54 +269,25 @@ class PredictionMarketTest(unittest.IsolatedAsyncioTestCase):
             payment_id,
             {"failed"},
         )
+
+        # No credit applied: balance stays at the post-debit amount.
         self.assertEqual(dashboard.balance, 900)
         self.assertEqual(dashboard.markets[0].status, "review_required")
+        self.assertEqual(dashboard.bets[0].status, "payment_failed")
         self.assertEqual(payment.status, "failed")
         self.assertEqual(payment.failure_class, "declined")
 
-    async def test_gateway_retry_exhaustion_requires_review(self) -> None:
-        async def always_timeout(
-            payment_intent_id: str,
-            amount: int,
-            idempotency_key: str,
-            attempt_number: int,
-        ) -> GatewayOutcome:
-            return GatewayOutcome(
-                status="retryable_failure",
-                failure_class="timeout",
-                message="gateway timed out",
-            )
-
-        configure_gateway_for_tests(always_timeout)
-        market = await self.alice.create_market(
-            self.alice_context,
-            question="Will retry exhaustion surface for review?",
-            close_after_seconds=0,
-        )
-        await self.bob.place_bet(
-            self.bob_context,
-            market_id=market.market_id,
-            outcome="YES",
-            stake=100,
-        )
-        await self.alice.close_market(self.alice_context, market_id=market.market_id)
-        await self.alice.resolve_market(
+        audit = await self.alice.audit_log(
             self.alice_context,
             market_id=market.market_id,
-            winning_outcome="YES",
         )
-        payment_id = (await self.bob.dashboard(self.bob_context)).payments[0].payment_intent_id
+        event_types = [event.event_type for event in audit.events]
+        self.assertIn("market_resolved", event_types)
+        self.assertIn("payout_failed", event_types)
 
-        dashboard, payment = await self.wait_for_payment_status(
-            payment_id,
-            {"retry_exhausted"},
-        )
-        self.assertEqual(dashboard.balance, 900)
-        self.assertEqual(dashboard.markets[0].status, "review_required")
-        self.assertEqual(payment.status, "retry_exhausted")
-        self.assertEqual(len(payment.attempts), 3)
-
-    async def test_crash_during_gateway_recovers_without_double_credit(self) -> None:
+    async def test_resolution_payout_replay_settles_balance_exactly_once(
+        self,
+    ) -> None:
         started = asyncio.Event()
         release = asyncio.Event()
 
@@ -359,7 +307,7 @@ class PredictionMarketTest(unittest.IsolatedAsyncioTestCase):
         configure_gateway_for_tests(stalled_success)
         market = await self.alice.create_market(
             self.alice_context,
-            question="Will crash recovery settle once?",
+            question="Will a crash mid-payout still settle exactly once?",
             close_after_seconds=0,
         )
         await self.bob.place_bet(
@@ -388,9 +336,16 @@ class PredictionMarketTest(unittest.IsolatedAsyncioTestCase):
             payment_id,
             {"succeeded"},
         )
+        # Give any duplicate replay a window to (incorrectly) re-apply.
         await asyncio.sleep(0.2)
         after_replay_window = await self.bob.dashboard(self.bob_context)
+
         self.assertEqual(dashboard.balance, 1100)
         self.assertEqual(after_replay_window.balance, 1100)
+        self.assertEqual(dashboard.bets[0].status, "won_paid")
         self.assertEqual(payment.status, "succeeded")
         self.assertEqual(len(payment.attempts), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

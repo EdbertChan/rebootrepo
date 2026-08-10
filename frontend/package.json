@@ -10,11 +10,14 @@
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "1.5.0",
     "@modelcontextprotocol/sdk": "1.29.0",
+    "@bufbuild/protobuf": "1.10.1",
     "@reboot-dev/reboot-api": "1.4.0",
     "@reboot-dev/reboot-react": "1.4.0",
+    "@reboot-dev/reboot-web": "1.4.0",
     "lucide-react": "^0.468.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "uuid": "^11.1.1",
     "zod": "^4.0.0"
   },
   "devDependencies": {
