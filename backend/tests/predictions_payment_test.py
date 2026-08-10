@@ -30,6 +30,8 @@ class PaymentExecutionTest(unittest.IsolatedAsyncioTestCase):
         self.revision = await self.rbt.up(
             self.application(),
             effect_validation=EffectValidation.DISABLED,
+            local_envoy=False,
+            servers=1,
         )
         self.alice_context = await self.rbt.create_external_context_as(
             "alice",
