@@ -199,6 +199,15 @@ async def _insert_id(
     )
 
 
+def _sequenced_audit_key(sequence: int, event_id: str) -> str:
+    # A market-scoped, monotonically increasing sequence number (rather than
+    # a wall-clock timestamp) keeps the audit index chronologically sorted
+    # even for events appended from a workflow: workflow calls must be
+    # deterministic across replays, and `time_ns()` is not, so a durable
+    # per-market counter is the only safe ordering key in that context.
+    return f"{sequence:020d}:{event_id}"
+
+
 async def _append_audit(
     context: TransactionContext | WorkflowContext,
     *,
@@ -214,9 +223,10 @@ async def _append_audit(
     event_id = str(uuid4()) if workflow_alias_prefix == "" else (
         f"{payment_intent_id}:{event_type}:{workflow_alias_prefix}"
     )
-    key = _map_key("audit") if workflow_alias_prefix == "" else event_id
 
     if workflow_alias_prefix == "":
+        sequence_response = await Market.ref(market_id).next_audit_sequence(context)
+        key = _sequenced_audit_key(sequence_response.sequence, event_id)
         await AuditEvent.create(
             context,
             event_id,
@@ -226,10 +236,15 @@ async def _append_audit(
             message=message,
             bet_id=bet_id,
             payment_intent_id=payment_intent_id,
-            sequence=0,
+            sequence=sequence_response.sequence,
         )
         await _insert_id(context, audit_index_id, key, event_id)
         return event_id
+
+    sequence_response = await Market.ref(market_id).per_workflow(
+        f"Sequence audit event {workflow_alias_prefix}"
+    ).next_audit_sequence(context)
+    key = _sequenced_audit_key(sequence_response.sequence, event_id)
 
     await AuditEvent.per_workflow(
         f"Create audit event {workflow_alias_prefix}"
@@ -242,7 +257,7 @@ async def _append_audit(
         message=message,
         bet_id=bet_id,
         payment_intent_id=payment_intent_id,
-        sequence=0,
+        sequence=sequence_response.sequence,
     )
     await OrderedMap.ref(audit_index_id).per_workflow(
         f"Index audit event {workflow_alias_prefix}"
@@ -769,6 +784,13 @@ class MarketServicer(Market.Servicer):
     ) -> None:
         self.state.status = MARKET_REVIEW_REQUIRED
 
+    async def next_audit_sequence(
+        self,
+        context: WriterContext,
+    ) -> Market.NextAuditSequenceResponse:
+        self.state.audit_sequence += 1
+        return Market.NextAuditSequenceResponse(sequence=self.state.audit_sequence)
+
 
 class BetServicer(Bet.Servicer):
     async def create(
@@ -927,6 +949,17 @@ class PaymentIntentServicer(PaymentIntent.Servicer):
                 failure_class=failure_class,
                 provider_transaction_id=provider_transaction_id,
                 message=message,
+            )
+            await _append_audit(
+                context,
+                market_id=payment.market_id,
+                audit_index_id=market.audit_index_id,
+                actor_user_id=payment.user_id,
+                event_type="payout_attempted",
+                message=f"Attempt {attempt_number}: gateway returned {status}.",
+                bet_id=payment.bet_id,
+                payment_intent_id=payment_intent_id,
+                workflow_alias_prefix=f"attempted-{attempt_number}",
             )
 
             if status == "success":
