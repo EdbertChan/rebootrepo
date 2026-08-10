@@ -88,6 +88,26 @@ def reset_gateway_for_tests() -> None:
     gateway_charge = _default_gateway_charge
 
 
+PayoutBarrier = Callable[[str], Awaitable[None]]
+
+
+async def _default_payout_barrier(checkpoint: str) -> None:
+    return None
+
+
+payout_barrier: PayoutBarrier = _default_payout_barrier
+
+
+def configure_payout_barrier_for_tests(barrier: PayoutBarrier) -> None:
+    global payout_barrier
+    payout_barrier = barrier
+
+
+def reset_payout_barrier_for_tests() -> None:
+    global payout_barrier
+    payout_barrier = _default_payout_barrier
+
+
 def _prediction_error(code: str, message: str) -> PredictionError:
     return PredictionError(code=code, message=message)
 
@@ -963,6 +983,12 @@ class PaymentIntentServicer(PaymentIntent.Servicer):
             )
 
             if status == "success":
+                # Test-only hook: lets tests stall replay exactly between the
+                # durably-recorded gateway confirmation and credit
+                # application, to prove a crash there resumes without
+                # re-invoking the gateway and without double-crediting.
+                # Production default is a no-op.
+                await payout_barrier(f"before-credit:{payment_intent_id}")
                 await User.ref(payment.user_id).per_workflow(
                     "Apply winner credit"
                 ).apply_payout(
